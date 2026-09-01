@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import InsightsView from './insights-view';
+import { countLibraryFilters, filterLibraryArtifacts } from './library-filters';
 
 type Project = {
   id: string;
@@ -171,13 +172,11 @@ export default function Home() {
   }, []);
 
   const artifacts = useMemo(() => {
-    const items = [...(library?.artifacts ?? [])].filter((artifact) => {
-      const inProject = selectedProject === 'all' || artifact.projectId === selectedProject;
-      const hasStatus = statusFilter === 'all'
-        || (statusFilter === 'live' && artifact.sessionStatus === 'open' && library?.server.running)
-        || (statusFilter === 'discovered' && artifact.sessionStatus === 'discovered');
-      const needle = query.trim().toLowerCase();
-      return inProject && hasStatus && (!needle || `${artifact.title} ${artifact.description} ${artifact.file}`.toLowerCase().includes(needle));
+    const items = filterLibraryArtifacts([...(library?.artifacts ?? [])], {
+      selectedProject,
+      query,
+      statusFilter,
+      serverRunning: Boolean(library?.server.running),
     });
     items.sort((a, b) => {
       if (sort === 'name') return a.title.localeCompare(b.title);
@@ -187,6 +186,12 @@ export default function Home() {
     });
     return items;
   }, [library, query, selectedProject, sort, statusFilter]);
+
+  const filterCounts = useMemo(() => countLibraryFilters(library?.artifacts ?? [], {
+    selectedProject,
+    query,
+    serverRunning: Boolean(library?.server.running),
+  }), [library, query, selectedProject]);
 
   useEffect(() => {
     const normalized = query.trim().toLowerCase();
@@ -481,9 +486,9 @@ export default function Home() {
 
           <div className="toolbar">
             <div className="filter-pills">
-              <button className={statusFilter === 'all' ? 'selected' : ''} onClick={() => setStatusFilter('all')}>All <span>{library?.artifacts.length ?? 0}</span></button>
-              <button className={statusFilter === 'live' ? 'selected' : ''} onClick={() => setStatusFilter('live')}>Live <span>{library?.artifacts.filter((item) => item.sessionStatus === 'open' && library.server.running).length ?? 0}</span></button>
-              <button className={statusFilter === 'discovered' ? 'selected' : ''} onClick={() => setStatusFilter('discovered')}>Discovered <span>{library?.artifacts.filter((item) => item.sessionStatus === 'discovered').length ?? 0}</span></button>
+              <button className={statusFilter === 'all' ? 'selected' : ''} onClick={() => setStatusFilter('all')}>All <span>{filterCounts.all}</span></button>
+              <button className={statusFilter === 'live' ? 'selected' : ''} onClick={() => setStatusFilter('live')}>Live <span>{filterCounts.live}</span></button>
+              <button className={statusFilter === 'discovered' ? 'selected' : ''} onClick={() => setStatusFilter('discovered')}>Discovered <span>{filterCounts.discovered}</span></button>
             </div>
             <div className="view-tools">
               <label>Sort <select value={sort} onChange={(event) => setSort(event.target.value as SortMode)}><option value="recent">Recently used</option><option value="edited">Last edited</option><option value="name">Name</option></select></label>
