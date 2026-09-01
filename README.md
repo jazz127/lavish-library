@@ -68,3 +68,7 @@ npm start
 ```
 
 The web UI listens on localhost and its filesystem companion service listens on `127.0.0.1:4318`. The companion service accepts browser requests only from `localhost` or `127.0.0.1` on the configured UI port, issues a fresh in-memory authorization token each time it starts, and limits artifact operations to files discovered by the same bounded scan used to build the library.
+
+## License
+
+[MIT](LICENSE) © 2026 Jarad Smith
