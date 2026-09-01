@@ -2,6 +2,13 @@
 
 Notable changes to Lavish Library are recorded here. Releases follow [Semantic Versioning](https://semver.org/).
 
+## [0.3.1](https://github.com/jazz127/lavish-library/compare/v0.3.0...v0.3.1) (2026-09-01)
+
+
+### Bug Fixes
+
+* add branded favicon ([#5](https://github.com/jazz127/lavish-library/issues/5)) ([ad68198](https://github.com/jazz127/lavish-library/commit/ad68198058ea039022395191156a67ec68ca4d24))
+
 ## [0.3.0](https://github.com/jazz127/lavish-library/compare/v0.2.0...v0.3.0) (2026-09-01)
 
 
