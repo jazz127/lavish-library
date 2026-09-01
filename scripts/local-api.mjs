@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { constants, watch } from 'node:fs';
 import { access, copyFile, cp, mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
@@ -7,6 +7,10 @@ import os from 'node:os';
 import path from 'node:path';
 
 const PORT = Number(process.env.LAVISH_TRACKER_API_PORT || 4318);
+const requestedUiPort = Number(process.env.LAVISH_TRACKER_UI_PORT || 3000);
+const UI_PORT = Number.isInteger(requestedUiPort) && requestedUiPort > 0 && requestedUiPort <= 65_535
+  ? requestedUiPort
+  : 3000;
 const HOST = '127.0.0.1';
 const STATE_FILE = process.env.LAVISH_AXI_STATE_DIR
   ? path.join(process.env.LAVISH_AXI_STATE_DIR, 'state.json')
@@ -18,15 +22,21 @@ const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const ANALYTICS_FILE = path.join(CONFIG_DIR, 'analytics.json');
 const LAVISH_BIN = process.env.LAVISH_AXI_BIN || '/opt/homebrew/bin/lavish-axi';
 const ARCHIVE_NAME = 'Lavish Library Archive';
+const API_TOKEN = randomBytes(32).toString('base64url');
 const artifactWatchers = new Map();
 const snapshotQueues = new Map();
 let analyticsQueue = Promise.resolve();
 let gitCache = { at: 0, value: [] };
+let knownArtifactsCache = { key: '', at: 0, value: null, pending: null };
 
 const idFor = (value) => createHash('sha1').update(value).digest('hex').slice(0, 12);
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 const exists = async (value) => access(value, constants.F_OK).then(() => true).catch(() => false);
 const slug = (value) => String(value || 'untitled').normalize('NFKD').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '').toLowerCase().slice(0, 70) || 'untitled';
+const ALLOWED_WEB_ORIGINS = new Set([
+  `http://localhost:${UI_PORT}`,
+  `http://127.0.0.1:${UI_PORT}`,
+]);
 
 async function readJson(file, fallback) {
   try { return JSON.parse(await readFile(file, 'utf8')); } catch { return fallback; }
@@ -170,6 +180,65 @@ function metadataFromHtml(html) {
 
 async function htmlMetadata(file) {
   try { return metadataFromHtml(await readFile(file, 'utf8')); } catch { return { title: '', description: '' }; }
+}
+
+async function fileCacheKey(file) {
+  try {
+    const details = await stat(file);
+    return `${details.mtimeMs}:${details.size}`;
+  } catch {
+    return 'missing';
+  }
+}
+
+async function scanKnownArtifacts(options = {}) {
+  const force = Boolean(options.force);
+  const [stateKey, configKey] = await Promise.all([fileCacheKey(STATE_FILE), fileCacheKey(CONFIG_FILE)]);
+  const cacheKey = `${stateKey}|${configKey}`;
+  if (!force && knownArtifactsCache.value && knownArtifactsCache.key === cacheKey) {
+    return knownArtifactsCache.value;
+  }
+  if (!force && knownArtifactsCache.pending && knownArtifactsCache.key === cacheKey) return knownArtifactsCache.pending;
+
+  knownArtifactsCache.key = cacheKey;
+  knownArtifactsCache.pending = (async () => {
+    const [state, config] = await Promise.all([
+      readJson(STATE_FILE, { sessions: {} }),
+      readConfig(),
+    ]);
+    const sessions = Object.values(state.sessions || {});
+    const projectMap = new Map();
+
+    for (const item of config.projects) {
+      const normalized = path.resolve(item.path);
+      projectMap.set(normalized, { id: idFor(normalized), name: item.name || path.basename(normalized), path: normalized, source: 'added' });
+    }
+    for (const session of sessions) {
+      const root = projectRootFor(session.file);
+      if (root && !projectMap.has(root)) projectMap.set(root, { id: idFor(root), name: path.basename(root), path: root, source: 'automatic' });
+    }
+
+    const projectFiles = new Map();
+    for (const project of projectMap.values()) {
+      const dirs = await findLavishDirs(project.path);
+      const files = new Set();
+      for (const dir of dirs) for (const file of await htmlFiles(dir)) files.add(path.resolve(file));
+      projectFiles.set(project.path, files);
+    }
+
+    const artifactPaths = new Set(sessions.map((session) => path.resolve(session.file)));
+    for (const files of projectFiles.values()) for (const file of files) artifactPaths.add(file);
+    return { sessions, projectMap, projectFiles, artifactPaths };
+  })();
+
+  try {
+    const value = await knownArtifactsCache.pending;
+    knownArtifactsCache = { key: cacheKey, at: Date.now(), value, pending: null };
+    return value;
+  } catch (error) {
+    knownArtifactsCache = { key: '', at: 0, value: null, pending: null };
+    throw error;
+  }
 }
 
 async function serverRunning() {
@@ -320,34 +389,18 @@ function syncArtifactWatchers(config, artifacts) {
 }
 
 async function buildLibrary() {
-  const [state, config, running] = await Promise.all([
-    readJson(STATE_FILE, { sessions: {} }),
+  const [knownArtifacts, config, running] = await Promise.all([
+    scanKnownArtifacts({ force: true }),
     readConfig(),
     serverRunning(),
   ]);
-  const sessions = Object.values(state.sessions || {});
-  const projectMap = new Map();
-
-  for (const item of config.projects) {
-    const normalized = path.resolve(item.path);
-    projectMap.set(normalized, { id: idFor(normalized), name: item.name || path.basename(normalized), path: normalized, source: 'added', exists: await exists(normalized) });
-  }
-  for (const session of sessions) {
-    const root = projectRootFor(session.file);
-    if (root && !projectMap.has(root)) projectMap.set(root, { id: idFor(root), name: path.basename(root), path: root, source: 'automatic', exists: await exists(root) });
-  }
-
-  const projectFiles = new Map();
-  for (const project of projectMap.values()) {
-    const dirs = await findLavishDirs(project.path);
-    const files = new Set();
-    for (const dir of dirs) for (const file of await htmlFiles(dir)) files.add(file);
-    projectFiles.set(project.path, files);
-  }
+  const sessions = knownArtifacts.sessions;
+  const projectMap = new Map(await Promise.all(
+    [...knownArtifacts.projectMap.values()].map(async (project) => [project.path, { ...project, exists: await exists(project.path) }]),
+  ));
 
   const looseProject = { id: 'loose', name: 'Loose & temporary', path: 'Known centrally by Lavish', source: 'automatic', exists: true };
-  const artifactPaths = new Set(sessions.map((session) => session.file));
-  for (const files of projectFiles.values()) for (const file of files) artifactPaths.add(file);
+  const artifactPaths = new Set(knownArtifacts.artifactPaths);
   const sessionByFile = new Map(sessions.map((session) => [path.resolve(session.file), session]));
   const artifacts = [];
   let hasLoose = false;
@@ -415,19 +468,49 @@ async function buildLibrary() {
   };
 }
 
+async function knownProjectMap() {
+  const { projectMap, sessions, artifactPaths } = await scanKnownArtifacts();
+  return { projectMap, sessions, artifactPaths };
+}
+
+function projectForFile(file, projectMap) {
+  const root = projectRootFor(file);
+  if (root && projectMap.has(root)) return projectMap.get(root);
+  return [...projectMap.values()].find((candidate) => file.startsWith(`${candidate.path}${path.sep}`)) || null;
+}
+
 async function artifactForFile(file) {
   const resolved = path.resolve(String(file || ''));
   if (!/\.html?$/i.test(resolved) || !(await exists(resolved))) throw new Error('That Lavish file no longer exists.');
-  const html = await readFile(resolved, 'utf8');
-  const metadata = metadataFromHtml(html);
+  const fileStat = await stat(resolved).catch(() => null);
+  if (!fileStat?.isFile()) throw new Error('That Lavish file no longer exists.');
+  const { projectMap, sessions, artifactPaths } = await knownProjectMap();
+  const session = sessions.find((candidate) => path.resolve(candidate.file || '') === resolved) || null;
+  const project = projectForFile(resolved, projectMap);
+  if (!artifactPaths.has(resolved)) throw new Error('That file is not a known Lavish artifact.');
+  const metadata = await htmlMetadata(resolved);
   const fallbackTitle = path.basename(resolved).replace(/\.html?$/i, '').replace(/[-_]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
-  return { id: idFor(resolved), file: resolved, exists: true, title: metadata.title || fallbackTitle, projectName: projectNameFor(resolved) };
+  return {
+    id: idFor(resolved),
+    file: resolved,
+    exists: true,
+    title: metadata.title || fallbackTitle,
+    description: metadata.description,
+    projectId: project?.id || 'loose',
+    projectName: project?.name || 'Loose & temporary',
+    relativePath: project ? path.relative(project.path, resolved) : resolved,
+    sessionStatus: session?.status || 'discovered',
+    pendingPrompts: Number(session?.pending_prompts || 0),
+    url: session?.url || null,
+    endedBy: session?.ended_by || null,
+    sessionMessages: Array.isArray(session?.chat) ? session.chat.length : 0,
+  };
 }
 
 async function versionsFor(file) {
+  const artifact = await artifactForFile(file);
   const config = await readConfig();
   if (!config.archiveRoot) return { enabled: false, versions: [] };
-  const artifact = await artifactForFile(file);
   const manifest = await readManifest(config, artifact);
   const currentHtml = await readFile(artifact.file, 'utf8');
   const currentSha = sha256(currentHtml);
@@ -726,9 +809,26 @@ async function buildInsights(days = 90) {
   };
 }
 
+function originAllowed(origin) {
+  return ALLOWED_WEB_ORIGINS.has(origin);
+}
+
+function tokenAllowed(value) {
+  const supplied = Buffer.from(String(value || ''));
+  const expected = Buffer.from(API_TOKEN);
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+}
+
+function hostAllowed(value) {
+  return value === `${HOST}:${PORT}` || value === `localhost:${PORT}`;
+}
+
 function json(res, status, value, origin = '') {
   const headers = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
-  if (/^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(origin)) headers['access-control-allow-origin'] = origin;
+  if (originAllowed(origin)) {
+    headers['access-control-allow-origin'] = origin;
+    headers.vary = 'origin';
+  }
   res.writeHead(status, headers);
   res.end(JSON.stringify(value));
 }
@@ -765,12 +865,23 @@ function chooseFolder(prompt) {
 
 const server = createServer(async (req, res) => {
   const origin = String(req.headers.origin || '');
+  if (!hostAllowed(String(req.headers.host || ''))) return json(res, 403, { error: 'Request host is not allowed.' });
+  if (origin && !originAllowed(origin)) return json(res, 403, { error: 'Browser origin is not allowed.' });
+  if (!origin && req.headers['sec-fetch-site']) return json(res, 403, { error: 'Browser origin is required.' });
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, { 'access-control-allow-origin': origin, 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-allow-headers': 'content-type' });
+    if (!origin) return json(res, 400, { error: 'Browser origin is required.' });
+    res.writeHead(204, { 'access-control-allow-origin': origin, 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-allow-headers': 'content-type,x-lavish-token', vary: 'origin' });
     return res.end();
   }
   try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
+    const url = new URL(req.url, `http://${HOST}:${PORT}`);
+    if (req.method === 'GET' && url.pathname === '/api/session') {
+      if (!origin) return json(res, 403, { error: 'Open Lavish Library in its local browser page first.' });
+      return json(res, 200, { token: API_TOKEN }, origin);
+    }
+    if (origin && url.pathname.startsWith('/api/') && !tokenAllowed(req.headers['x-lavish-token'])) {
+      return json(res, 401, { error: 'The local browser session is not authorized.' }, origin);
+    }
     if (req.method === 'GET' && url.pathname === '/api/library') return json(res, 200, await buildLibrary(), origin);
     if (req.method === 'GET' && url.pathname === '/api/insights') return json(res, 200, await buildInsights(Number(url.searchParams.get('days') || 90)), origin);
     if (req.method === 'GET' && url.pathname === '/api/artifacts/versions') return json(res, 200, await versionsFor(url.searchParams.get('file')), origin);

@@ -1,8 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
-
-const API = 'http://127.0.0.1:4318/api';
+import { apiFetch } from './api-client';
 
 type InsightSummary = {
   totalArtifacts: number;
@@ -66,7 +65,7 @@ export default function InsightsView({ mode }: { mode: 'observatory' | 'review' 
   const load = useCallback(async (quiet = false) => {
     if (!quiet) setLoading(true);
     try {
-      const response = await fetch(`${API}/insights?days=${days}`, { cache: 'no-store' });
+      const response = await apiFetch(`/insights?days=${days}`, { cache: 'no-store' });
       const value = await response.json();
       if (!response.ok) throw new Error(value.error || 'Could not read Lavish insights.');
       setInsights(value);
@@ -80,7 +79,7 @@ export default function InsightsView({ mode }: { mode: 'observatory' | 'review' 
 
   useEffect(() => {
     const controller = new AbortController();
-    fetch(`${API}/insights?days=${days}`, { cache: 'no-store', signal: controller.signal })
+    apiFetch(`/insights?days=${days}`, { cache: 'no-store', signal: controller.signal })
       .then(async (response) => {
         const value = await response.json();
         if (!response.ok) throw new Error(value.error || 'Could not read Lavish insights.');
@@ -91,7 +90,7 @@ export default function InsightsView({ mode }: { mode: 'observatory' | 'review' 
       .finally(() => setLoading(false));
     return () => controller.abort();
   }, [days]);
-  useEffect(() => { void fetch(`${API}/events`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'insights_open' }) }); }, []);
+  useEffect(() => { void apiFetch('/events', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'insights_open' }) }); }, []);
 
   const evolution = useMemo(() => {
     if (!insights) return [];
@@ -101,7 +100,7 @@ export default function InsightsView({ mode }: { mode: 'observatory' | 'review' 
   async function saveFeedback(candidate: FeedbackCandidate, value: string, outcome = 'none') {
     setNotice(`Saving feedback for “${candidate.title}”…`);
     try {
-      const response = await fetch(`${API}/artifacts/feedback`, {
+      const response = await apiFetch('/artifacts/feedback', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ file: candidate.file, value, outcome }),
@@ -118,7 +117,7 @@ export default function InsightsView({ mode }: { mode: 'observatory' | 'review' 
   async function saveOutcome(candidate: FeedbackCandidate, outcome: string) {
     setNotice(`Recording the outcome for “${candidate.title}”…`);
     try {
-      const response = await fetch(`${API}/artifacts/feedback`, {
+      const response = await apiFetch('/artifacts/feedback', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ file: candidate.file, outcome }),
       });
       const result = await response.json();
@@ -131,7 +130,7 @@ export default function InsightsView({ mode }: { mode: 'observatory' | 'review' 
   }
 
   async function updateRecommendation(id: string, action: 'done' | 'dismissed' | 'snoozed') {
-    const response = await fetch(`${API}/recommendations/action`, {
+    const response = await apiFetch('/recommendations/action', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, action }),
     });
     const result = await response.json();
@@ -141,7 +140,7 @@ export default function InsightsView({ mode }: { mode: 'observatory' | 'review' 
   }
 
   async function saveSettings(next: Settings) {
-    const response = await fetch(`${API}/insights/settings`, {
+    const response = await apiFetch('/insights/settings', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(next),
     });
     const result = await response.json();
@@ -152,7 +151,7 @@ export default function InsightsView({ mode }: { mode: 'observatory' | 'review' 
 
   async function openArtifact(candidate: FeedbackCandidate) {
     setNotice(`Opening “${candidate.title}”…`);
-    const response = await fetch(`${API}/artifacts/open`, {
+    const response = await apiFetch('/artifacts/open', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ file: candidate.file }),
     });
     const result = await response.json();
@@ -160,7 +159,7 @@ export default function InsightsView({ mode }: { mode: 'observatory' | 'review' 
   }
 
   async function markReviewed() {
-    await fetch(`${API}/events`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'review_open', label: 'Lavish Review completed' }) });
+    await apiFetch('/events', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'review_open', label: 'Lavish Review completed' }) });
     setNotice('Review marked complete. New evidence will shape the next one.');
     await load(true);
   }

@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react';
 import InsightsView from './insights-view';
+import { apiFetch } from './api-client';
 import { countLibraryFilters, filterLibraryArtifacts } from './library-filters';
 
 type Project = {
@@ -72,8 +73,6 @@ type SortMode = 'recent' | 'edited' | 'name';
 type StatusFilter = 'all' | 'live' | 'discovered';
 type PageSection = 'library' | 'observatory' | 'review';
 
-const API = 'http://127.0.0.1:4318/api';
-
 function relativeTime(value: string | null) {
   if (!value) return 'Never opened';
   const delta = Date.now() - new Date(value).getTime();
@@ -133,7 +132,7 @@ export default function Home() {
   async function loadLibrary(quiet = false) {
     if (!quiet) setLoading(true);
     try {
-      const response = await fetch(`${API}/library`, { cache: 'no-store' });
+      const response = await apiFetch('/library', { cache: 'no-store' });
       if (!response.ok) throw new Error('The local library service did not respond.');
       setLibrary(await response.json());
       setNotice('');
@@ -146,7 +145,7 @@ export default function Home() {
 
   useEffect(() => {
     const controller = new AbortController();
-    fetch(`${API}/library`, { cache: 'no-store', signal: controller.signal })
+    apiFetch('/library', { cache: 'no-store', signal: controller.signal })
       .then((response) => {
         if (!response.ok) throw new Error('The local library service did not respond.');
         return response.json();
@@ -198,7 +197,7 @@ export default function Home() {
     if (section !== 'library' || normalized.length < 2 || trackedSearchRef.current === normalized) return;
     const timer = window.setTimeout(() => {
       trackedSearchRef.current = normalized;
-      void fetch(`${API}/events`, {
+      void apiFetch('/events', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ type: 'search', query: query.trim(), resultCount: artifacts.length, projectId: selectedProject }),
@@ -210,7 +209,7 @@ export default function Home() {
   function selectProject(projectId: string) {
     setSection('library');
     setSelectedProject(projectId);
-    void fetch(`${API}/events`, {
+    void apiFetch('/events', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'project_view', projectId }),
     });
   }
@@ -218,7 +217,7 @@ export default function Home() {
   async function chooseFolder() {
     setNotice('Opening the folder picker…');
     try {
-      const response = await fetch(`${API}/projects/choose`, { method: 'POST' });
+      const response = await apiFetch('/projects/choose', { method: 'POST' });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || 'Could not add that folder.');
       setShowAdd(false);
@@ -231,7 +230,7 @@ export default function Home() {
   async function addManualFolder(event: React.FormEvent) {
     event.preventDefault();
     try {
-      const response = await fetch(`${API}/projects`, {
+      const response = await apiFetch('/projects', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ path: manualPath }),
@@ -249,7 +248,7 @@ export default function Home() {
   async function openArtifact(artifact: Artifact) {
     setNotice(`Opening “${artifact.title}”…`);
     try {
-      const response = await fetch(`${API}/artifacts/open`, {
+      const response = await apiFetch('/artifacts/open', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ file: artifact.file, reopen: artifact.sessionStatus === 'ended' && artifact.endedBy === 'user', query: query.trim() || null }),
@@ -266,7 +265,7 @@ export default function Home() {
   async function revealArtifact(artifact: Artifact) {
     setNotice(`Revealing “${artifact.title}” in Finder…`);
     try {
-      const response = await fetch(`${API}/artifacts/reveal`, {
+      const response = await apiFetch('/artifacts/reveal', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ file: artifact.file }),
@@ -282,7 +281,7 @@ export default function Home() {
   async function chooseArchiveFolder() {
     setNotice('Choose a folder for your Lavish archive…');
     try {
-      const response = await fetch(`${API}/archive/choose`, { method: 'POST' });
+      const response = await apiFetch('/archive/choose', { method: 'POST' });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || 'Could not configure the archive.');
       setNotice('Creating the first protected copy of each Lavish…');
@@ -296,7 +295,7 @@ export default function Home() {
   async function disableArchive() {
     if (!window.confirm('Pause automatic backups? Existing archived versions will be kept.')) return;
     try {
-      const response = await fetch(`${API}/archive/disable`, { method: 'POST' });
+      const response = await apiFetch('/archive/disable', { method: 'POST' });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || 'Could not pause backups.');
       await loadLibrary(true);
@@ -307,7 +306,7 @@ export default function Home() {
 
   async function revealArchive() {
     try {
-      const response = await fetch(`${API}/archive/reveal`, { method: 'POST' });
+      const response = await apiFetch('/archive/reveal', { method: 'POST' });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || 'Could not reveal the archive.');
     } catch (error) {
@@ -320,7 +319,7 @@ export default function Home() {
     setHistoryLoading(true);
     setHistory(null);
     try {
-      const response = await fetch(`${API}/artifacts/versions?file=${encodeURIComponent(artifact.file)}`, { cache: 'no-store' });
+      const response = await apiFetch(`/artifacts/versions?file=${encodeURIComponent(artifact.file)}`, { cache: 'no-store' });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || 'Could not load version history.');
       setHistory(result);
@@ -335,7 +334,7 @@ export default function Home() {
     if (!historyArtifact) return;
     setNotice(`Protecting “${historyArtifact.title}”…`);
     try {
-      const response = await fetch(`${API}/artifacts/snapshot`, {
+      const response = await apiFetch('/artifacts/snapshot', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ file: historyArtifact.file }),
       });
       const result = await response.json();
@@ -350,7 +349,7 @@ export default function Home() {
   async function openArchivedVersion(version: ArchivedVersion) {
     if (!historyArtifact) return;
     try {
-      const response = await fetch(`${API}/versions/open`, {
+      const response = await apiFetch('/versions/open', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ file: historyArtifact.file, versionId: version.id }),
       });
       const result = await response.json();
@@ -365,7 +364,7 @@ export default function Home() {
     if (!window.confirm(`Restore the version from ${fullDate(version.createdAt)}? The current file will be backed up first.`)) return;
     setNotice(`Restoring “${historyArtifact.title}”…`);
     try {
-      const response = await fetch(`${API}/versions/restore`, {
+      const response = await apiFetch('/versions/restore', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ file: historyArtifact.file, versionId: version.id }),
       });
       const result = await response.json();

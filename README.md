@@ -37,6 +37,10 @@ The app distinguishes recorded evidence from unknown history. It can backfill fi
 - `v0.1.0` — local Lavish library and protected version archive
 - `v0.2.0` — Signal Observatory, Lavish Review, feedback, recommendations, and plan evolution
 
+Releases follow semantic versioning. Conventional `fix:`, `feat:`, and breaking-change commits are collected by Release Please into a version-and-changelog pull request; merging that pull request creates the matching GitHub Release and `vX.Y.Z` tag. The project is not published to npm.
+
+See [CHANGELOG.md](CHANGELOG.md) for the release history.
+
 ## Version archive
 
 Choose **Set up archive** in the app and select any local or synced folder. The app creates a readable `Lavish Library Archive` beneath it, grouped by project and artifact. Each version has its own HTML file, local assets, checksum, timestamps, and manifest entry.
@@ -45,14 +49,27 @@ The first scan creates a baseline. While the app is running, watched files are b
 
 ## Run it
 
-Requires Node.js 22.13 or newer and `lavish-axi` installed at `/opt/homebrew/bin/lavish-axi`.
+Requires Node.js 22.13 or newer and the [`lavish-axi` CLI](https://github.com/kunchenguid/lavish-axi#session-hook). Install Lavish globally, then install this project's dependencies:
 
 ```bash
+npm install -g lavish-axi
 npm install
 npm run dev
 ```
 
+The app expects Lavish at `/opt/homebrew/bin/lavish-axi` by default. If `command -v lavish-axi` reports another location, pass it when starting the app:
+
+```bash
+LAVISH_AXI_BIN="$(command -v lavish-axi)" npm run dev
+```
+
 Open [http://localhost:3000](http://localhost:3000). The library refreshes when the page loads and whenever you press the refresh button.
+
+To use another local UI port, set it explicitly for both services:
+
+```bash
+LAVISH_TRACKER_UI_PORT=3007 npm run dev
+```
 
 ## Production-style local run
 
@@ -61,4 +78,8 @@ npm run build
 npm start
 ```
 
-The web UI listens on localhost and its filesystem companion service listens on `127.0.0.1:4318`. The companion service only accepts browser requests from local origins.
+The web UI listens on localhost and its filesystem companion service listens on `127.0.0.1:4318`. The companion service accepts browser requests only from `localhost` or `127.0.0.1` on the configured UI port, issues a fresh in-memory authorization token each time it starts, and limits artifact operations to files discovered by the same bounded scan used to build the library.
+
+## License
+
+[MIT](LICENSE) © 2026 Jarad Smith
