@@ -19,8 +19,6 @@ const ANALYTICS_FILE = path.join(CONFIG_DIR, 'analytics.json');
 const LAVISH_BIN = process.env.LAVISH_AXI_BIN || '/opt/homebrew/bin/lavish-axi';
 const ARCHIVE_NAME = 'Lavish Library Archive';
 const API_TOKEN = randomBytes(32).toString('base64url');
-const ALLOWED_WEB_ORIGINS = new Set((process.env.LAVISH_TRACKER_WEB_ORIGINS || 'http://localhost:3000,http://127.0.0.1:3000')
-  .split(',').map((value) => value.trim()).filter(Boolean));
 const artifactWatchers = new Map();
 const snapshotQueues = new Map();
 let analyticsQueue = Promise.resolve();
@@ -30,6 +28,22 @@ const idFor = (value) => createHash('sha1').update(value).digest('hex').slice(0,
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 const exists = async (value) => access(value, constants.F_OK).then(() => true).catch(() => false);
 const slug = (value) => String(value || 'untitled').normalize('NFKD').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '').toLowerCase().slice(0, 70) || 'untitled';
+const loopbackHostnames = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
+
+function parseOrigin(value) {
+  try { return new URL(value); } catch { return null; }
+}
+
+function loopbackOriginAllowed(value) {
+  const origin = parseOrigin(value);
+  if (!origin) return false;
+  return ['http:', 'https:'].includes(origin.protocol) && loopbackHostnames.has(origin.hostname);
+}
+
+const ALLOWED_WEB_ORIGINS = new Set((process.env.LAVISH_TRACKER_WEB_ORIGINS || '')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(loopbackOriginAllowed));
 
 async function readJson(file, fallback) {
   try { return JSON.parse(await readFile(file, 'utf8')); } catch { return fallback; }
@@ -418,15 +432,65 @@ async function buildLibrary() {
   };
 }
 
+async function knownProjectMap() {
+  const [state, config] = await Promise.all([
+    readJson(STATE_FILE, { sessions: {} }),
+    readConfig(),
+  ]);
+  const sessions = Object.values(state.sessions || {});
+  const projectMap = new Map();
+
+  for (const item of config.projects) {
+    const normalized = path.resolve(item.path);
+    projectMap.set(normalized, { id: idFor(normalized), name: item.name || path.basename(normalized), path: normalized });
+  }
+  for (const session of sessions) {
+    const root = projectRootFor(session.file);
+    if (root && !projectMap.has(root)) projectMap.set(root, { id: idFor(root), name: path.basename(root), path: root });
+  }
+
+  return { projectMap, sessions };
+}
+
+function projectForFile(file, projectMap) {
+  const root = projectRootFor(file);
+  if (root && projectMap.has(root)) return projectMap.get(root);
+  return [...projectMap.values()].find((candidate) => file.startsWith(`${candidate.path}${path.sep}`)) || null;
+}
+
+function fileIsTrackedInProject(file, project) {
+  if (!project) return false;
+  const relative = path.relative(project.path, file);
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return false;
+  return relative.split(path.sep).includes('.lavish') && !/-portable\.html?$/i.test(path.basename(file));
+}
+
 async function artifactForFile(file) {
   const resolved = path.resolve(String(file || ''));
   if (!/\.html?$/i.test(resolved) || !(await exists(resolved))) throw new Error('That Lavish file no longer exists.');
-  const library = await buildLibrary();
-  const artifact = library.artifacts.find((candidate) => path.resolve(candidate.file) === resolved && candidate.exists);
-  if (!artifact) throw new Error('That file is not a known Lavish artifact.');
   const fileStat = await stat(resolved).catch(() => null);
   if (!fileStat?.isFile()) throw new Error('That Lavish file no longer exists.');
-  return artifact;
+  const { projectMap, sessions } = await knownProjectMap();
+  const session = sessions.find((candidate) => path.resolve(candidate.file || '') === resolved) || null;
+  const project = projectForFile(resolved, projectMap);
+  if (!session && !fileIsTrackedInProject(resolved, project)) throw new Error('That file is not a known Lavish artifact.');
+  const metadata = await htmlMetadata(resolved);
+  const fallbackTitle = path.basename(resolved).replace(/\.html?$/i, '').replace(/[-_]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
+  return {
+    id: idFor(resolved),
+    file: resolved,
+    exists: true,
+    title: metadata.title || fallbackTitle,
+    description: metadata.description,
+    projectId: project?.id || 'loose',
+    projectName: project?.name || 'Loose & temporary',
+    relativePath: project ? path.relative(project.path, resolved) : resolved,
+    sessionStatus: session?.status || 'discovered',
+    pendingPrompts: Number(session?.pending_prompts || 0),
+    url: session?.url || null,
+    endedBy: session?.ended_by || null,
+    sessionMessages: Array.isArray(session?.chat) ? session.chat.length : 0,
+  };
 }
 
 async function versionsFor(file) {
@@ -732,7 +796,7 @@ async function buildInsights(days = 90) {
 }
 
 function originAllowed(origin) {
-  return ALLOWED_WEB_ORIGINS.has(origin);
+  return loopbackOriginAllowed(origin) && (ALLOWED_WEB_ORIGINS.size === 0 || ALLOWED_WEB_ORIGINS.has(origin));
 }
 
 function tokenAllowed(value) {

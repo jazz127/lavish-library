@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtemp, mkdir, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readdir, writeFile } from 'node:fs/promises';
 import { after, before, test } from 'node:test';
 import os from 'node:os';
 import path from 'node:path';
@@ -14,9 +14,13 @@ let lavishFile;
 let outsideFile;
 
 async function waitForApi() {
+  return waitForService(port);
+}
+
+async function waitForService(servicePort) {
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/health`);
+      const response = await fetch(`http://127.0.0.1:${servicePort}/health`);
       if (response.ok) return;
     } catch { /* Service is still starting. */ }
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -103,7 +107,7 @@ test('rejects hostile browser origins and requires a session token', async () =>
   const originlessBrowser = await fetch(`${api}/library`, { headers: { 'sec-fetch-site': 'cross-site' } });
   assert.equal(originlessBrowser.status, 403);
 
-  const origin = 'http://localhost:3000';
+  const origin = 'http://localhost:3007';
   const preflight = await fetch(`${api}/library`, {
     method: 'OPTIONS',
     headers: { origin, 'access-control-request-method': 'GET', 'access-control-request-headers': 'x-lavish-token' },
@@ -122,10 +126,47 @@ test('rejects hostile browser origins and requires a session token', async () =>
   const authorized = await fetch(`${api}/library`, { headers: { origin, 'x-lavish-token': session.token } });
   assert.equal(authorized.status, 200);
 
-  const ipOrigin = 'http://127.0.0.1:3000';
+  const ipOrigin = 'http://127.0.0.1:4173';
   const ipSession = await fetch(`${api}/session`, { headers: { origin: ipOrigin } });
   assert.equal(ipSession.status, 200);
   assert.equal(ipSession.headers.get('access-control-allow-origin'), ipOrigin);
+});
+
+test('ignores archive side effects when resolving one artifact', async () => {
+  const archiveFixture = await mkdtemp(path.join(os.tmpdir(), 'lavish-tracker-archive-test-'));
+  const project = path.join(archiveFixture, 'Archive Project');
+  const lavishDir = path.join(project, '.lavish');
+  const stateDir = path.join(archiveFixture, 'lavish-state');
+  const configDir = path.join(archiveFixture, 'tracker-state');
+  const archiveRoot = path.join(archiveFixture, 'archive-root');
+  const servicePort = port + 1;
+  const serviceApi = `http://127.0.0.1:${servicePort}/api`;
+  const primaryFile = path.join(lavishDir, 'primary.html');
+  const secondaryFile = path.join(lavishDir, 'secondary.html');
+  await Promise.all([mkdir(lavishDir, { recursive: true }), mkdir(stateDir, { recursive: true }), mkdir(configDir, { recursive: true }), mkdir(archiveRoot, { recursive: true })]);
+  await writeFile(primaryFile, '<!doctype html><title>Primary</title>');
+  await writeFile(secondaryFile, '<!doctype html><title>Secondary</title>');
+  await writeFile(path.join(stateDir, 'state.json'), JSON.stringify({ sessions: {} }));
+  await writeFile(path.join(configDir, 'config.json'), JSON.stringify({ projects: [{ path: project, name: 'Archive Project' }], archiveRoot }));
+
+  const archiveService = spawn(process.execPath, [path.join(root, 'scripts/local-api.mjs')], {
+    cwd: root,
+    env: { ...process.env, LAVISH_TRACKER_API_PORT: String(servicePort), LAVISH_TRACKER_CONFIG_DIR: configDir, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_AXI_BIN: '/usr/bin/true' },
+    stdio: 'ignore',
+  });
+
+  try {
+    await waitForService(servicePort);
+    const response = await fetch(`${serviceApi}/artifacts/versions?file=${encodeURIComponent(primaryFile)}`);
+    const result = await response.json();
+    assert.equal(response.status, 200);
+    assert.deepEqual(result.versions, []);
+
+    const archivedEntries = await readdir(archiveRoot);
+    assert.equal(archivedEntries.length, 0);
+  } finally {
+    archiveService.kill('SIGTERM');
+  }
 });
 
 test('rejects HTML files outside the known Lavish library', async () => {

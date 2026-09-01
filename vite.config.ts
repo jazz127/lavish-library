@@ -48,10 +48,9 @@ export default defineConfig(async () => {
     css: { postcss: { plugins: [tailwindcss()] } },
     server: {
       port: 3000,
-      strictPort: true,
       ...(isCodexSeatbeltSandbox ? { watch: { useFsEvents: false, usePolling: true } } : {}),
     },
-    preview: { port: 3000, strictPort: true },
+    preview: { port: 3000 },
     plugins: [
       vinext(),
       sites(),
