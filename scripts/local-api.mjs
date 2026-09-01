@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { constants, watch } from 'node:fs';
 import { access, copyFile, cp, mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
@@ -18,6 +18,9 @@ const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const ANALYTICS_FILE = path.join(CONFIG_DIR, 'analytics.json');
 const LAVISH_BIN = process.env.LAVISH_AXI_BIN || '/opt/homebrew/bin/lavish-axi';
 const ARCHIVE_NAME = 'Lavish Library Archive';
+const API_TOKEN = randomBytes(32).toString('base64url');
+const ALLOWED_WEB_ORIGINS = new Set((process.env.LAVISH_TRACKER_WEB_ORIGINS || 'http://localhost:3000,http://127.0.0.1:3000')
+  .split(',').map((value) => value.trim()).filter(Boolean));
 const artifactWatchers = new Map();
 const snapshotQueues = new Map();
 let analyticsQueue = Promise.resolve();
@@ -418,16 +421,18 @@ async function buildLibrary() {
 async function artifactForFile(file) {
   const resolved = path.resolve(String(file || ''));
   if (!/\.html?$/i.test(resolved) || !(await exists(resolved))) throw new Error('That Lavish file no longer exists.');
-  const html = await readFile(resolved, 'utf8');
-  const metadata = metadataFromHtml(html);
-  const fallbackTitle = path.basename(resolved).replace(/\.html?$/i, '').replace(/[-_]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
-  return { id: idFor(resolved), file: resolved, exists: true, title: metadata.title || fallbackTitle, projectName: projectNameFor(resolved) };
+  const library = await buildLibrary();
+  const artifact = library.artifacts.find((candidate) => path.resolve(candidate.file) === resolved && candidate.exists);
+  if (!artifact) throw new Error('That file is not a known Lavish artifact.');
+  const fileStat = await stat(resolved).catch(() => null);
+  if (!fileStat?.isFile()) throw new Error('That Lavish file no longer exists.');
+  return artifact;
 }
 
 async function versionsFor(file) {
+  const artifact = await artifactForFile(file);
   const config = await readConfig();
   if (!config.archiveRoot) return { enabled: false, versions: [] };
-  const artifact = await artifactForFile(file);
   const manifest = await readManifest(config, artifact);
   const currentHtml = await readFile(artifact.file, 'utf8');
   const currentSha = sha256(currentHtml);
@@ -726,9 +731,26 @@ async function buildInsights(days = 90) {
   };
 }
 
+function originAllowed(origin) {
+  return ALLOWED_WEB_ORIGINS.has(origin);
+}
+
+function tokenAllowed(value) {
+  const supplied = Buffer.from(String(value || ''));
+  const expected = Buffer.from(API_TOKEN);
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+}
+
+function hostAllowed(value) {
+  return value === `${HOST}:${PORT}` || value === `localhost:${PORT}`;
+}
+
 function json(res, status, value, origin = '') {
   const headers = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
-  if (/^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(origin)) headers['access-control-allow-origin'] = origin;
+  if (originAllowed(origin)) {
+    headers['access-control-allow-origin'] = origin;
+    headers.vary = 'origin';
+  }
   res.writeHead(status, headers);
   res.end(JSON.stringify(value));
 }
@@ -765,12 +787,23 @@ function chooseFolder(prompt) {
 
 const server = createServer(async (req, res) => {
   const origin = String(req.headers.origin || '');
+  if (!hostAllowed(String(req.headers.host || ''))) return json(res, 403, { error: 'Request host is not allowed.' });
+  if (origin && !originAllowed(origin)) return json(res, 403, { error: 'Browser origin is not allowed.' });
+  if (!origin && req.headers['sec-fetch-site']) return json(res, 403, { error: 'Browser origin is required.' });
   if (req.method === 'OPTIONS') {
-    res.writeHead(204, { 'access-control-allow-origin': origin, 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-allow-headers': 'content-type' });
+    if (!origin) return json(res, 400, { error: 'Browser origin is required.' });
+    res.writeHead(204, { 'access-control-allow-origin': origin, 'access-control-allow-methods': 'GET,POST,OPTIONS', 'access-control-allow-headers': 'content-type,x-lavish-token', vary: 'origin' });
     return res.end();
   }
   try {
-    const url = new URL(req.url, `http://${req.headers.host}`);
+    const url = new URL(req.url, `http://${HOST}:${PORT}`);
+    if (req.method === 'GET' && url.pathname === '/api/session') {
+      if (!origin) return json(res, 403, { error: 'Open Lavish Library in its local browser page first.' });
+      return json(res, 200, { token: API_TOKEN }, origin);
+    }
+    if (origin && url.pathname.startsWith('/api/') && !tokenAllowed(req.headers['x-lavish-token'])) {
+      return json(res, 401, { error: 'The local browser session is not authorized.' }, origin);
+    }
     if (req.method === 'GET' && url.pathname === '/api/library') return json(res, 200, await buildLibrary(), origin);
     if (req.method === 'GET' && url.pathname === '/api/insights') return json(res, 200, await buildInsights(Number(url.searchParams.get('days') || 90)), origin);
     if (req.method === 'GET' && url.pathname === '/api/artifacts/versions') return json(res, 200, await versionsFor(url.searchParams.get('file')), origin);

@@ -11,6 +11,7 @@ const api = `http://127.0.0.1:${port}/api`;
 let service;
 let fixture;
 let lavishFile;
+let outsideFile;
 
 async function waitForApi() {
   for (let attempt = 0; attempt < 40; attempt += 1) {
@@ -38,7 +39,9 @@ before(async () => {
   const configDir = path.join(fixture, 'tracker-state');
   await Promise.all([mkdir(lavishDir, { recursive: true }), mkdir(stateDir, { recursive: true }), mkdir(configDir, { recursive: true })]);
   lavishFile = path.join(lavishDir, 'identity-plan.html');
+  outsideFile = path.join(fixture, 'untracked.html');
   await writeFile(lavishFile, '<!doctype html><html><head><title>Identity migration plan</title><meta name="description" content="Entra access architecture and delivery decisions"></head><body><h1>Identity migration</h1></body></html>');
+  await writeFile(outsideFile, '<!doctype html><title>Not a Lavish</title>');
   await writeFile(path.join(stateDir, 'state.json'), JSON.stringify({ sessions: { demo: { file: lavishFile, status: 'open', updated_at: '2026-08-30T00:00:00.000Z', chat: [{ at: '2026-08-30T00:00:00.000Z' }] } } }));
   await writeFile(path.join(configDir, 'config.json'), JSON.stringify({ projects: [{ path: project, name: 'Signal Project' }], archiveRoot: null }));
   service = spawn(process.execPath, [path.join(root, 'scripts/local-api.mjs')], {
@@ -75,4 +78,68 @@ test('records search, value, and outcome signals in insights', async () => {
 test('never enables foreground-time tracking', async () => {
   const result = await post('/insights/settings', { cadence: 'tunable', manual: true, weekly: true, monthly: true, contextual: true, foregroundTime: true });
   assert.equal(result.settings.foregroundTime, false);
+});
+
+test('rejects hostile browser origins and requires a session token', async () => {
+  const searchesBefore = (await (await fetch(`${api}/insights?days=3650`)).json()).summary.trackedSearches;
+  const hostilePost = await fetch(`${api}/events`, {
+    method: 'POST',
+    headers: { origin: 'https://attacker.example', 'content-type': 'application/json' },
+    body: JSON.stringify({ type: 'search', query: 'should-not-record', resultCount: 0 }),
+  });
+  assert.equal(hostilePost.status, 403);
+  const searchesAfter = (await (await fetch(`${api}/insights?days=3650`)).json()).summary.trackedSearches;
+  assert.equal(searchesAfter, searchesBefore);
+
+  const hostile = await fetch(`${api}/archive/disable`, {
+    method: 'OPTIONS',
+    headers: { origin: 'https://attacker.example', 'access-control-request-method': 'POST', 'access-control-request-headers': 'content-type' },
+  });
+  assert.equal(hostile.status, 403);
+  assert.equal(hostile.headers.get('access-control-allow-origin'), null);
+
+  const nullOrigin = await fetch(`${api}/archive/disable`, { method: 'POST', headers: { origin: 'null' } });
+  assert.equal(nullOrigin.status, 403);
+  const originlessBrowser = await fetch(`${api}/library`, { headers: { 'sec-fetch-site': 'cross-site' } });
+  assert.equal(originlessBrowser.status, 403);
+
+  const origin = 'http://localhost:3000';
+  const preflight = await fetch(`${api}/library`, {
+    method: 'OPTIONS',
+    headers: { origin, 'access-control-request-method': 'GET', 'access-control-request-headers': 'x-lavish-token' },
+  });
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get('access-control-allow-origin'), origin);
+  assert.match(preflight.headers.get('access-control-allow-headers'), /x-lavish-token/);
+  const sessionResponse = await fetch(`${api}/session`, { headers: { origin } });
+  const session = await sessionResponse.json();
+  assert.equal(sessionResponse.status, 200);
+  assert.equal(sessionResponse.headers.get('access-control-allow-origin'), origin);
+  assert.equal(typeof session.token, 'string');
+
+  const unauthorized = await fetch(`${api}/library`, { headers: { origin } });
+  assert.equal(unauthorized.status, 401);
+  const authorized = await fetch(`${api}/library`, { headers: { origin, 'x-lavish-token': session.token } });
+  assert.equal(authorized.status, 200);
+
+  const ipOrigin = 'http://127.0.0.1:3000';
+  const ipSession = await fetch(`${api}/session`, { headers: { origin: ipOrigin } });
+  assert.equal(ipSession.status, 200);
+  assert.equal(ipSession.headers.get('access-control-allow-origin'), ipOrigin);
+});
+
+test('rejects HTML files outside the known Lavish library', async () => {
+  const response = await fetch(`${api}/artifacts/open`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ file: outsideFile }),
+  });
+  const result = await response.json();
+  assert.equal(response.status, 400);
+  assert.match(result.error, /not a known Lavish artifact/i);
+
+  const versionsResponse = await fetch(`${api}/artifacts/versions?file=${encodeURIComponent(outsideFile)}`);
+  const versionsResult = await versionsResponse.json();
+  assert.equal(versionsResponse.status, 400);
+  assert.match(versionsResult.error, /not a known Lavish artifact/i);
 });

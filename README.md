@@ -61,4 +61,4 @@ npm run build
 npm start
 ```
 
-The web UI listens on localhost and its filesystem companion service listens on `127.0.0.1:4318`. The companion service only accepts browser requests from local origins.
+The web UI listens on localhost and its filesystem companion service listens on `127.0.0.1:4318`. The companion service accepts browser requests only from the exact local UI origins, issues a fresh in-memory authorization token each time it starts, and limits artifact operations to files in the known Lavish library. Set `LAVISH_TRACKER_WEB_ORIGINS` to a comma-separated allowlist only when intentionally running the UI on a different local origin.
