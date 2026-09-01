@@ -53,9 +53,8 @@ function eventGlyph(type: string) {
   return ({ version: '↶', session: '◌', git: '⌁', open: '↗', feedback: '♡', restore: '↺', recommendation: '✦' } as Record<string, string>)[type] || '·';
 }
 
-export default function InsightsView() {
+export default function InsightsView({ mode }: { mode: 'observatory' | 'review' }) {
   const [insights, setInsights] = useState<Insights | null>(null);
-  const [mode, setMode] = useState<'observe' | 'review'>('observe');
   const [days, setDays] = useState(90);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -177,20 +176,20 @@ export default function InsightsView() {
     <div className="insights-shell">
       <header className="insights-hero">
         <div>
-          <span className="insights-eyebrow">✦ LAVISH INTELLIGENCE</span>
-          <h1>Observe the signals.<br /><em>Review the practice.</em></h1>
-          <p>A private evidence layer for understanding what earns attention, what creates outcomes, and how your plans change while the work unfolds.</p>
+          <span className="insights-eyebrow">✦ {mode === 'observatory' ? 'SIGNAL OBSERVATORY' : 'YOUR LAVISH REVIEW'}</span>
+          {mode === 'observatory' ? <>
+            <h1>Follow the evidence.<br /><em>Watch the work evolve.</em></h1>
+            <p>Explore what earns attention, what repeats across projects, and how versions, sessions, searches, and commits change the shape of your plans.</p>
+          </> : <>
+            <h1>Turn evidence into reflection.<br /><em>Choose what comes next.</em></h1>
+            <p>A calm synthesis of what proved useful, what fell quiet, what could become a reusable practice, and where your feedback can sharpen the next review.</p>
+          </>}
         </div>
         <div className="insights-controls">
           <label>Evidence window<select value={days} onChange={(event) => { setLoading(true); setDays(Number(event.target.value)); }}><option value={30}>30 days</option><option value={90}>90 days</option><option value={365}>One year</option><option value={3650}>All recorded</option></select></label>
           <button onClick={() => setSettingsOpen((value) => !value)}>⚙ Tune rhythm</button>
         </div>
       </header>
-
-      <div className="insights-mode" role="tablist" aria-label="Insights views">
-        <button className={mode === 'observe' ? 'active' : ''} onClick={() => setMode('observe')}><span>C</span><div><strong>Signal Observatory</strong><small>Explore evidence and evolving plans</small></div></button>
-        <button className={mode === 'review' ? 'active' : ''} onClick={() => setMode('review')}><span>D</span><div><strong>Lavish Review</strong><small>Reflect, respond, and choose what’s next</small></div></button>
-      </div>
 
       {settingsOpen && <section className="rhythm-panel">
         <div><span className="section-kicker">REFLECTION RHYTHM</span><h2>A mix you can tune</h2><p>Prompts stay local. Foreground-time tracking is permanently excluded.</p></div>
@@ -201,7 +200,7 @@ export default function InsightsView() {
 
       {notice && <div className="insights-notice" role="status">{notice}</div>}
 
-      {mode === 'observe' ? <>
+      {mode === 'observatory' ? <>
         <section className="signal-ledger">
           <div className="ledger-heading"><span className="section-kicker">SIGNAL LEDGER</span><h2>What the system actually knows</h2><p>No magic score. Every conclusion stays traceable to evidence.</p></div>
           <div className="ledger-grid">

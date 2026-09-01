@@ -25,7 +25,7 @@ All project paths and preferences stay on the Mac in `~/.lavish-tracker/config.j
 
 ## Insights
 
-Choose **Insights** in the sidebar to move between two complementary views:
+The sidebar exposes two complementary destinations directly:
 
 - **Signal Observatory** shows the evidence: activity, repeat-use signals, topic shelves, searches, recurring Lavish shapes, and the evolving timeline of versions, sessions, restores, feedback, and Git commits.
 - **Lavish Review** turns that evidence into a calm narrative, an actionable recommendation queue, dormant work worth revisiting, possible templates, and quick value/outcome labels.

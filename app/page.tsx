@@ -69,6 +69,7 @@ type Library = {
 
 type SortMode = 'recent' | 'edited' | 'name';
 type StatusFilter = 'all' | 'live' | 'discovered';
+type PageSection = 'library' | 'observatory' | 'review';
 
 const API = 'http://127.0.0.1:4318/api';
 
@@ -116,7 +117,7 @@ export default function Home() {
   const [sort, setSort] = useState<SortMode>('recent');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [view, setView] = useState<'grid' | 'list'>('grid');
-  const [section, setSection] = useState<'library' | 'insights'>('library');
+  const [section, setSection] = useState<PageSection>('library');
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState('');
   const [manualPath, setManualPath] = useState('');
@@ -387,8 +388,11 @@ export default function Home() {
           <button className={`nav-item ${section === 'library' && selectedProject === 'all' ? 'active' : ''}`} onClick={() => selectProject('all')}>
             <Icon name="grid" /><span>All lavishes</span><small>{library?.artifacts.length ?? '—'}</small>
           </button>
-          <button className={`nav-item ${section === 'insights' ? 'active' : ''}`} onClick={() => setSection('insights')}>
-            <span className="nav-insight-glyph">◎</span><span>Insights</span><small>NEW</small>
+          <button className={`nav-item ${section === 'observatory' ? 'active' : ''}`} onClick={() => setSection('observatory')}>
+            <span className="nav-insight-glyph">◎</span><span>Observatory</span><small>C</small>
+          </button>
+          <button className={`nav-item ${section === 'review' ? 'active' : ''}`} onClick={() => setSection('review')}>
+            <span className="nav-review-glyph">✦</span><span>Review</span><small>D</small>
           </button>
           <div className="nav-item muted" aria-label={`${liveCount} known sessions`}><span className="live-dot" /><span>Known sessions</span><small>{liveCount}</small></div>
           <button className={`nav-item ${section === 'library' && showArchive ? 'active' : ''}`} onClick={() => { setSection('library'); setShowArchive((value) => !value); }}>
@@ -429,7 +433,7 @@ export default function Home() {
             <button className={`archive-button ${library?.archive?.enabled ? 'enabled' : ''}`} onClick={() => setShowArchive((value) => !value)}><Icon name="archive" /> {library?.archive?.enabled ? `${library.archive.totalVersions} versions` : 'Set up archive'}</button>
             <button className="add-button" onClick={() => setShowAdd((value) => !value)}><Icon name="plus" /> Add folder</button>
           </> : <>
-            <div className="insights-topbar-copy"><strong>Insights</strong><span>Local evidence · no foreground-time tracking</span></div>
+            <div className="insights-topbar-copy"><strong>{section === 'observatory' ? 'Signal Observatory' : 'Lavish Review'}</strong><span>{section === 'observatory' ? 'Explore local evidence and evolving plans' : 'Reflect, respond, and choose what comes next'}</span></div>
             <button className="archive-button enabled" onClick={() => setSection('library')}><Icon name="grid" /> Back to library</button>
           </>}
         </header>
@@ -463,7 +467,7 @@ export default function Home() {
           </section>
         )}
 
-        {section === 'insights' ? <InsightsView /> : <div className="content">
+        {section !== 'library' ? <InsightsView mode={section} /> : <div className="content">
           <div className="eyebrow"><Icon name="spark" /> YOUR CREATIVE ARCHIVE</div>
           <div className="title-row">
             <div>
