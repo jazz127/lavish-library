@@ -388,15 +388,17 @@ export default function Home() {
           <button className={`nav-item ${section === 'library' && selectedProject === 'all' ? 'active' : ''}`} onClick={() => selectProject('all')}>
             <Icon name="grid" /><span>All lavishes</span><small>{library?.artifacts.length ?? '—'}</small>
           </button>
-          <button className={`nav-item ${section === 'observatory' ? 'active' : ''}`} onClick={() => setSection('observatory')}>
-            <span className="nav-insight-glyph">◎</span><span>Observatory</span><small>C</small>
-          </button>
-          <button className={`nav-item ${section === 'review' ? 'active' : ''}`} onClick={() => setSection('review')}>
-            <span className="nav-review-glyph">✦</span><span>Review</span><small>D</small>
-          </button>
           <div className="nav-item muted" aria-label={`${liveCount} known sessions`}><span className="live-dot" /><span>Known sessions</span><small>{liveCount}</small></div>
           <button className={`nav-item ${section === 'library' && showArchive ? 'active' : ''}`} onClick={() => { setSection('library'); setShowArchive((value) => !value); }}>
             <Icon name="archive" /><span>Version archive</span><small>{library?.archive?.totalVersions ?? '—'}</small>
+          </button>
+
+          <p className="nav-label nav-section-label">Insights</p>
+          <button className={`nav-item ${section === 'observatory' ? 'active' : ''}`} onClick={() => setSection('observatory')}>
+            <span className="nav-insight-glyph">◎</span><span>Observatory</span>
+          </button>
+          <button className={`nav-item ${section === 'review' ? 'active' : ''}`} onClick={() => setSection('review')}>
+            <span className="nav-review-glyph">✦</span><span>Review</span>
           </button>
 
           <div className="nav-heading">
