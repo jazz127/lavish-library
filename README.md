@@ -39,6 +39,8 @@ The app distinguishes recorded evidence from unknown history. It can backfill fi
 
 Releases follow semantic versioning. Conventional `fix:`, `feat:`, and breaking-change commits are collected by Release Please into a version-and-changelog pull request; merging that pull request creates the matching GitHub Release and `vX.Y.Z` tag. The project is not published to npm.
 
+See [CHANGELOG.md](CHANGELOG.md) for the release history.
+
 ## Version archive
 
 Choose **Set up archive** in the app and select any local or synced folder. The app creates a readable `Lavish Library Archive` beneath it, grouped by project and artifact. Each version has its own HTML file, local assets, checksum, timestamps, and manifest entry.
