@@ -27,6 +27,7 @@ const artifactWatchers = new Map();
 const snapshotQueues = new Map();
 let analyticsQueue = Promise.resolve();
 let gitCache = { at: 0, value: [] };
+let knownArtifactsCache = { key: '', at: 0, value: null, pending: null };
 
 const idFor = (value) => createHash('sha1').update(value).digest('hex').slice(0, 12);
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
@@ -181,6 +182,65 @@ async function htmlMetadata(file) {
   try { return metadataFromHtml(await readFile(file, 'utf8')); } catch { return { title: '', description: '' }; }
 }
 
+async function fileCacheKey(file) {
+  try {
+    const details = await stat(file);
+    return `${details.mtimeMs}:${details.size}`;
+  } catch {
+    return 'missing';
+  }
+}
+
+async function scanKnownArtifacts(options = {}) {
+  const force = Boolean(options.force);
+  const [stateKey, configKey] = await Promise.all([fileCacheKey(STATE_FILE), fileCacheKey(CONFIG_FILE)]);
+  const cacheKey = `${stateKey}|${configKey}`;
+  if (!force && knownArtifactsCache.value && knownArtifactsCache.key === cacheKey) {
+    return knownArtifactsCache.value;
+  }
+  if (!force && knownArtifactsCache.pending && knownArtifactsCache.key === cacheKey) return knownArtifactsCache.pending;
+
+  knownArtifactsCache.key = cacheKey;
+  knownArtifactsCache.pending = (async () => {
+    const [state, config] = await Promise.all([
+      readJson(STATE_FILE, { sessions: {} }),
+      readConfig(),
+    ]);
+    const sessions = Object.values(state.sessions || {});
+    const projectMap = new Map();
+
+    for (const item of config.projects) {
+      const normalized = path.resolve(item.path);
+      projectMap.set(normalized, { id: idFor(normalized), name: item.name || path.basename(normalized), path: normalized, source: 'added' });
+    }
+    for (const session of sessions) {
+      const root = projectRootFor(session.file);
+      if (root && !projectMap.has(root)) projectMap.set(root, { id: idFor(root), name: path.basename(root), path: root, source: 'automatic' });
+    }
+
+    const projectFiles = new Map();
+    for (const project of projectMap.values()) {
+      const dirs = await findLavishDirs(project.path);
+      const files = new Set();
+      for (const dir of dirs) for (const file of await htmlFiles(dir)) files.add(path.resolve(file));
+      projectFiles.set(project.path, files);
+    }
+
+    const artifactPaths = new Set(sessions.map((session) => path.resolve(session.file)));
+    for (const files of projectFiles.values()) for (const file of files) artifactPaths.add(file);
+    return { sessions, projectMap, projectFiles, artifactPaths };
+  })();
+
+  try {
+    const value = await knownArtifactsCache.pending;
+    knownArtifactsCache = { key: cacheKey, at: Date.now(), value, pending: null };
+    return value;
+  } catch (error) {
+    knownArtifactsCache = { key: '', at: 0, value: null, pending: null };
+    throw error;
+  }
+}
+
 async function serverRunning() {
   try {
     const response = await fetch('http://127.0.0.1:4387/health', { signal: AbortSignal.timeout(650) });
@@ -329,34 +389,18 @@ function syncArtifactWatchers(config, artifacts) {
 }
 
 async function buildLibrary() {
-  const [state, config, running] = await Promise.all([
-    readJson(STATE_FILE, { sessions: {} }),
+  const [knownArtifacts, config, running] = await Promise.all([
+    scanKnownArtifacts({ force: true }),
     readConfig(),
     serverRunning(),
   ]);
-  const sessions = Object.values(state.sessions || {});
-  const projectMap = new Map();
-
-  for (const item of config.projects) {
-    const normalized = path.resolve(item.path);
-    projectMap.set(normalized, { id: idFor(normalized), name: item.name || path.basename(normalized), path: normalized, source: 'added', exists: await exists(normalized) });
-  }
-  for (const session of sessions) {
-    const root = projectRootFor(session.file);
-    if (root && !projectMap.has(root)) projectMap.set(root, { id: idFor(root), name: path.basename(root), path: root, source: 'automatic', exists: await exists(root) });
-  }
-
-  const projectFiles = new Map();
-  for (const project of projectMap.values()) {
-    const dirs = await findLavishDirs(project.path);
-    const files = new Set();
-    for (const dir of dirs) for (const file of await htmlFiles(dir)) files.add(file);
-    projectFiles.set(project.path, files);
-  }
+  const sessions = knownArtifacts.sessions;
+  const projectMap = new Map(await Promise.all(
+    [...knownArtifacts.projectMap.values()].map(async (project) => [project.path, { ...project, exists: await exists(project.path) }]),
+  ));
 
   const looseProject = { id: 'loose', name: 'Loose & temporary', path: 'Known centrally by Lavish', source: 'automatic', exists: true };
-  const artifactPaths = new Set(sessions.map((session) => session.file));
-  for (const files of projectFiles.values()) for (const file of files) artifactPaths.add(file);
+  const artifactPaths = new Set(knownArtifacts.artifactPaths);
   const sessionByFile = new Map(sessions.map((session) => [path.resolve(session.file), session]));
   const artifacts = [];
   let hasLoose = false;
@@ -425,30 +469,7 @@ async function buildLibrary() {
 }
 
 async function knownProjectMap() {
-  const [state, config] = await Promise.all([
-    readJson(STATE_FILE, { sessions: {} }),
-    readConfig(),
-  ]);
-  const sessions = Object.values(state.sessions || {});
-  const projectMap = new Map();
-
-  for (const item of config.projects) {
-    const normalized = path.resolve(item.path);
-    projectMap.set(normalized, { id: idFor(normalized), name: item.name || path.basename(normalized), path: normalized });
-  }
-  for (const session of sessions) {
-    const root = projectRootFor(session.file);
-    if (root && !projectMap.has(root)) projectMap.set(root, { id: idFor(root), name: path.basename(root), path: root });
-  }
-
-  const artifactPaths = new Set(sessions.map((session) => path.resolve(session.file)));
-  for (const project of projectMap.values()) {
-    const dirs = await findLavishDirs(project.path);
-    for (const dir of dirs) {
-      for (const file of await htmlFiles(dir)) artifactPaths.add(path.resolve(file));
-    }
-  }
-
+  const { projectMap, sessions, artifactPaths } = await scanKnownArtifacts();
   return { projectMap, sessions, artifactPaths };
 }
 

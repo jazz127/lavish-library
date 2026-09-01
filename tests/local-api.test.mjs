@@ -196,3 +196,21 @@ test('rejects HTML files outside the known Lavish library', async () => {
   assert.equal(undiscoveredResponse.status, 400);
   assert.match(undiscoveredResult.error, /not a known Lavish artifact/i);
 });
+
+test('library refresh updates the cached artifact allowlist', async () => {
+  const addedFile = path.join(path.dirname(lavishFile), 'fresh-artifact.html');
+  await writeFile(addedFile, '<!doctype html><title>Fresh Artifact</title>');
+
+  const beforeRefresh = await fetch(`${api}/artifacts/versions?file=${encodeURIComponent(addedFile)}`);
+  assert.equal(beforeRefresh.status, 400);
+
+  const libraryResponse = await fetch(`${api}/library`);
+  const library = await libraryResponse.json();
+  assert.equal(libraryResponse.status, 200);
+  assert(library.artifacts.some((artifact) => artifact.file === addedFile));
+
+  const afterRefresh = await fetch(`${api}/artifacts/versions?file=${encodeURIComponent(addedFile)}`);
+  const versions = await afterRefresh.json();
+  assert.equal(afterRefresh.status, 200);
+  assert.deepEqual(versions.versions, []);
+});
