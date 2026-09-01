@@ -43,14 +43,19 @@ export default defineConfig(async () => {
 
   // Wrangler snapshots its log path while the Cloudflare plugin is imported.
   const { cloudflare } = await import('@cloudflare/vite-plugin');
+  const requestedUiPort = Number(process.env.LAVISH_TRACKER_UI_PORT || 3000);
+  const uiPort = Number.isInteger(requestedUiPort) && requestedUiPort > 0 && requestedUiPort <= 65_535
+    ? requestedUiPort
+    : 3000;
 
   return {
     css: { postcss: { plugins: [tailwindcss()] } },
     server: {
-      port: 3000,
+      port: uiPort,
+      strictPort: true,
       ...(isCodexSeatbeltSandbox ? { watch: { useFsEvents: false, usePolling: true } } : {}),
     },
-    preview: { port: 3000 },
+    preview: { port: uiPort, strictPort: true },
     plugins: [
       vinext(),
       sites(),

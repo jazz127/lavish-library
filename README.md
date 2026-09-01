@@ -54,6 +54,12 @@ npm run dev
 
 Open [http://localhost:3000](http://localhost:3000). The library refreshes when the page loads and whenever you press the refresh button.
 
+To use another local UI port, set it explicitly for both services:
+
+```bash
+LAVISH_TRACKER_UI_PORT=3007 npm run dev
+```
+
 ## Production-style local run
 
 ```bash
@@ -61,4 +67,4 @@ npm run build
 npm start
 ```
 
-The web UI listens on localhost and its filesystem companion service listens on `127.0.0.1:4318`. The companion service accepts browser requests only from the exact local UI origins, issues a fresh in-memory authorization token each time it starts, and limits artifact operations to files in the known Lavish library. Set `LAVISH_TRACKER_WEB_ORIGINS` to a comma-separated allowlist only when intentionally running the UI on a different local origin.
+The web UI listens on localhost and its filesystem companion service listens on `127.0.0.1:4318`. The companion service accepts browser requests only from `localhost` or `127.0.0.1` on the configured UI port, issues a fresh in-memory authorization token each time it starts, and limits artifact operations to files discovered by the same bounded scan used to build the library.

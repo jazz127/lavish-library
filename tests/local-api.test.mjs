@@ -12,6 +12,7 @@ let service;
 let fixture;
 let lavishFile;
 let outsideFile;
+let undiscoveredLavishFile;
 
 async function waitForApi() {
   return waitForService(port);
@@ -44,13 +45,16 @@ before(async () => {
   await Promise.all([mkdir(lavishDir, { recursive: true }), mkdir(stateDir, { recursive: true }), mkdir(configDir, { recursive: true })]);
   lavishFile = path.join(lavishDir, 'identity-plan.html');
   outsideFile = path.join(fixture, 'untracked.html');
+  undiscoveredLavishFile = path.join(project, 'one', 'two', 'three', 'four', '.lavish', 'hidden.html');
+  await mkdir(path.dirname(undiscoveredLavishFile), { recursive: true });
   await writeFile(lavishFile, '<!doctype html><html><head><title>Identity migration plan</title><meta name="description" content="Entra access architecture and delivery decisions"></head><body><h1>Identity migration</h1></body></html>');
   await writeFile(outsideFile, '<!doctype html><title>Not a Lavish</title>');
+  await writeFile(undiscoveredLavishFile, '<!doctype html><title>Outside scanner depth</title>');
   await writeFile(path.join(stateDir, 'state.json'), JSON.stringify({ sessions: { demo: { file: lavishFile, status: 'open', updated_at: '2026-08-30T00:00:00.000Z', chat: [{ at: '2026-08-30T00:00:00.000Z' }] } } }));
   await writeFile(path.join(configDir, 'config.json'), JSON.stringify({ projects: [{ path: project, name: 'Signal Project' }], archiveRoot: null }));
   service = spawn(process.execPath, [path.join(root, 'scripts/local-api.mjs')], {
     cwd: root,
-    env: { ...process.env, LAVISH_TRACKER_API_PORT: String(port), LAVISH_TRACKER_CONFIG_DIR: configDir, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_AXI_BIN: '/usr/bin/true' },
+    env: { ...process.env, LAVISH_TRACKER_API_PORT: String(port), LAVISH_TRACKER_UI_PORT: '3007', LAVISH_TRACKER_CONFIG_DIR: configDir, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_AXI_BIN: '/usr/bin/true' },
     stdio: 'ignore',
   });
   await waitForApi();
@@ -126,7 +130,10 @@ test('rejects hostile browser origins and requires a session token', async () =>
   const authorized = await fetch(`${api}/library`, { headers: { origin, 'x-lavish-token': session.token } });
   assert.equal(authorized.status, 200);
 
-  const ipOrigin = 'http://127.0.0.1:4173';
+  const otherLoopbackApp = await fetch(`${api}/session`, { headers: { origin: 'http://localhost:4173' } });
+  assert.equal(otherLoopbackApp.status, 403);
+
+  const ipOrigin = 'http://127.0.0.1:3007';
   const ipSession = await fetch(`${api}/session`, { headers: { origin: ipOrigin } });
   assert.equal(ipSession.status, 200);
   assert.equal(ipSession.headers.get('access-control-allow-origin'), ipOrigin);
@@ -183,4 +190,9 @@ test('rejects HTML files outside the known Lavish library', async () => {
   const versionsResult = await versionsResponse.json();
   assert.equal(versionsResponse.status, 400);
   assert.match(versionsResult.error, /not a known Lavish artifact/i);
+
+  const undiscoveredResponse = await fetch(`${api}/artifacts/versions?file=${encodeURIComponent(undiscoveredLavishFile)}`);
+  const undiscoveredResult = await undiscoveredResponse.json();
+  assert.equal(undiscoveredResponse.status, 400);
+  assert.match(undiscoveredResult.error, /not a known Lavish artifact/i);
 });

@@ -7,6 +7,10 @@ import os from 'node:os';
 import path from 'node:path';
 
 const PORT = Number(process.env.LAVISH_TRACKER_API_PORT || 4318);
+const requestedUiPort = Number(process.env.LAVISH_TRACKER_UI_PORT || 3000);
+const UI_PORT = Number.isInteger(requestedUiPort) && requestedUiPort > 0 && requestedUiPort <= 65_535
+  ? requestedUiPort
+  : 3000;
 const HOST = '127.0.0.1';
 const STATE_FILE = process.env.LAVISH_AXI_STATE_DIR
   ? path.join(process.env.LAVISH_AXI_STATE_DIR, 'state.json')
@@ -28,22 +32,10 @@ const idFor = (value) => createHash('sha1').update(value).digest('hex').slice(0,
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 const exists = async (value) => access(value, constants.F_OK).then(() => true).catch(() => false);
 const slug = (value) => String(value || 'untitled').normalize('NFKD').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '').toLowerCase().slice(0, 70) || 'untitled';
-const loopbackHostnames = new Set(['127.0.0.1', 'localhost', '[::1]', '::1']);
-
-function parseOrigin(value) {
-  try { return new URL(value); } catch { return null; }
-}
-
-function loopbackOriginAllowed(value) {
-  const origin = parseOrigin(value);
-  if (!origin) return false;
-  return ['http:', 'https:'].includes(origin.protocol) && loopbackHostnames.has(origin.hostname);
-}
-
-const ALLOWED_WEB_ORIGINS = new Set((process.env.LAVISH_TRACKER_WEB_ORIGINS || '')
-  .split(',')
-  .map((value) => value.trim())
-  .filter(loopbackOriginAllowed));
+const ALLOWED_WEB_ORIGINS = new Set([
+  `http://localhost:${UI_PORT}`,
+  `http://127.0.0.1:${UI_PORT}`,
+]);
 
 async function readJson(file, fallback) {
   try { return JSON.parse(await readFile(file, 'utf8')); } catch { return fallback; }
@@ -449,7 +441,15 @@ async function knownProjectMap() {
     if (root && !projectMap.has(root)) projectMap.set(root, { id: idFor(root), name: path.basename(root), path: root });
   }
 
-  return { projectMap, sessions };
+  const artifactPaths = new Set(sessions.map((session) => path.resolve(session.file)));
+  for (const project of projectMap.values()) {
+    const dirs = await findLavishDirs(project.path);
+    for (const dir of dirs) {
+      for (const file of await htmlFiles(dir)) artifactPaths.add(path.resolve(file));
+    }
+  }
+
+  return { projectMap, sessions, artifactPaths };
 }
 
 function projectForFile(file, projectMap) {
@@ -458,22 +458,15 @@ function projectForFile(file, projectMap) {
   return [...projectMap.values()].find((candidate) => file.startsWith(`${candidate.path}${path.sep}`)) || null;
 }
 
-function fileIsTrackedInProject(file, project) {
-  if (!project) return false;
-  const relative = path.relative(project.path, file);
-  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return false;
-  return relative.split(path.sep).includes('.lavish') && !/-portable\.html?$/i.test(path.basename(file));
-}
-
 async function artifactForFile(file) {
   const resolved = path.resolve(String(file || ''));
   if (!/\.html?$/i.test(resolved) || !(await exists(resolved))) throw new Error('That Lavish file no longer exists.');
   const fileStat = await stat(resolved).catch(() => null);
   if (!fileStat?.isFile()) throw new Error('That Lavish file no longer exists.');
-  const { projectMap, sessions } = await knownProjectMap();
+  const { projectMap, sessions, artifactPaths } = await knownProjectMap();
   const session = sessions.find((candidate) => path.resolve(candidate.file || '') === resolved) || null;
   const project = projectForFile(resolved, projectMap);
-  if (!session && !fileIsTrackedInProject(resolved, project)) throw new Error('That file is not a known Lavish artifact.');
+  if (!artifactPaths.has(resolved)) throw new Error('That file is not a known Lavish artifact.');
   const metadata = await htmlMetadata(resolved);
   const fallbackTitle = path.basename(resolved).replace(/\.html?$/i, '').replace(/[-_]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
   return {
@@ -796,7 +789,7 @@ async function buildInsights(days = 90) {
 }
 
 function originAllowed(origin) {
-  return loopbackOriginAllowed(origin) && (ALLOWED_WEB_ORIGINS.size === 0 || ALLOWED_WEB_ORIGINS.has(origin));
+  return ALLOWED_WEB_ORIGINS.has(origin);
 }
 
 function tokenAllowed(value) {
