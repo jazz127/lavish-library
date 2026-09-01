@@ -12,8 +12,17 @@ A private, local-first browser library for finding and reopening Lavish review s
 - Opens or reopens an artifact with `lavish-axi`
 - Reveals an artifact in Finder
 - Adds project folders with a native macOS folder picker or a pasted path
+- Creates content-addressed snapshots whenever a watched Lavish changes
+- Copies each HTML file and its linked local assets into a chosen archive folder
+- Shows an artifact timeline with size/line deltas, archived previews, and safe restore
 
 All project paths and preferences stay on the Mac in `~/.lavish-tracker/config.json`. Nothing is uploaded by the app.
+
+## Version archive
+
+Choose **Set up archive** in the app and select any local or synced folder. The app creates a readable `Lavish Library Archive` beneath it, grouped by project and artifact. Each version has its own HTML file, local assets, checksum, timestamps, and manifest entry.
+
+The first scan creates a baseline. While the app is running, watched files are backed up shortly after each saved change; a 30-second reconciliation scan catches new artifacts and anything a watcher missed. Restoring an older version always archives the current file first. Pausing backups never deletes existing copies.
 
 ## Run it
 

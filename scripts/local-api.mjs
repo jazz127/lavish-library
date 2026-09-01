@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { constants } from 'node:fs';
-import { access, mkdir, readFile, readdir, stat, writeFile } from 'node:fs/promises';
+import { constants, watch } from 'node:fs';
+import { access, copyFile, cp, mkdir, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -14,28 +14,52 @@ const STATE_FILE = process.env.LAVISH_AXI_STATE_DIR
 const CONFIG_DIR = path.join(os.homedir(), '.lavish-tracker');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
 const LAVISH_BIN = process.env.LAVISH_AXI_BIN || '/opt/homebrew/bin/lavish-axi';
+const ARCHIVE_NAME = 'Lavish Library Archive';
+const artifactWatchers = new Map();
+const snapshotQueues = new Map();
 
 const idFor = (value) => createHash('sha1').update(value).digest('hex').slice(0, 12);
+const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 const exists = async (value) => access(value, constants.F_OK).then(() => true).catch(() => false);
+const slug = (value) => String(value || 'untitled').normalize('NFKD').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '').toLowerCase().slice(0, 70) || 'untitled';
 
 async function readJson(file, fallback) {
   try { return JSON.parse(await readFile(file, 'utf8')); } catch { return fallback; }
 }
 
+async function writeJson(file, value) {
+  await mkdir(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  await rename(temporary, file);
+}
+
 async function readConfig() {
-  const config = await readJson(CONFIG_FILE, { projects: [] });
-  return { projects: Array.isArray(config.projects) ? config.projects : [] };
+  const config = await readJson(CONFIG_FILE, { projects: [], archiveRoot: null });
+  return {
+    projects: Array.isArray(config.projects) ? config.projects : [],
+    archiveRoot: typeof config.archiveRoot === 'string' && config.archiveRoot.trim() ? path.resolve(config.archiveRoot) : null,
+  };
 }
 
 async function saveConfig(config) {
   await mkdir(CONFIG_DIR, { recursive: true });
-  await writeFile(CONFIG_FILE, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+  await writeJson(CONFIG_FILE, config);
+}
+
+function archiveHome(config) {
+  return config.archiveRoot ? path.join(config.archiveRoot, ARCHIVE_NAME) : null;
 }
 
 function projectRootFor(file) {
   const marker = `${path.sep}.lavish${path.sep}`;
   const index = file.lastIndexOf(marker);
   return index >= 0 ? file.slice(0, index) : null;
+}
+
+function projectNameFor(file) {
+  const root = projectRootFor(file);
+  return root ? path.basename(root) : 'Loose & temporary';
 }
 
 async function findLavishDirs(root, depth = 0) {
@@ -68,13 +92,15 @@ function cleanText(value) {
   return String(value || '').replace(/<[^>]+>/g, ' ').replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/\s+/g, ' ').trim();
 }
 
+function metadataFromHtml(html) {
+  const searchable = html.slice(0, 300_000);
+  const title = cleanText(searchable.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || searchable.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)?.[1]);
+  const description = cleanText(searchable.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)/i)?.[1] || searchable.match(/<p[^>]*>([\s\S]*?)<\/p>/i)?.[1]);
+  return { title, description: description.slice(0, 180) };
+}
+
 async function htmlMetadata(file) {
-  try {
-    const html = (await readFile(file, 'utf8')).slice(0, 300_000);
-    const title = cleanText(html.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1] || html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)?.[1]);
-    const description = cleanText(html.match(/<meta[^>]+name=["']description["'][^>]+content=["']([^"']*)/i)?.[1] || html.match(/<p[^>]*>([\s\S]*?)<\/p>/i)?.[1]);
-    return { title, description: description.slice(0, 180) };
-  } catch { return { title: '', description: '' }; }
+  try { return metadataFromHtml(await readFile(file, 'utf8')); } catch { return { title: '', description: '' }; }
 }
 
 async function serverRunning() {
@@ -83,6 +109,145 @@ async function serverRunning() {
     const value = await response.json();
     return response.ok && value.app === 'lavish-axi';
   } catch { return false; }
+}
+
+function artifactArchiveDir(config, artifact) {
+  return path.join(archiveHome(config), slug(projectNameFor(artifact.file)), `${slug(path.basename(artifact.file, path.extname(artifact.file)))}--${artifact.id}`);
+}
+
+function manifestPath(config, artifact) {
+  return path.join(artifactArchiveDir(config, artifact), 'manifest.json');
+}
+
+function localAssetReferences(html) {
+  const references = new Set();
+  for (const match of html.matchAll(/(?:src|href)\s*=\s*["']([^"']+)["']/gi)) references.add(match[1]);
+  for (const match of html.matchAll(/srcset\s*=\s*["']([^"']+)["']/gi)) {
+    for (const item of match[1].split(',')) references.add(item.trim().split(/\s+/)[0]);
+  }
+  for (const match of html.matchAll(/url\(\s*["']?([^"')]+)["']?\s*\)/gi)) references.add(match[1]);
+  return [...references];
+}
+
+function safeLocalReference(reference) {
+  if (!reference || reference.startsWith('/') || reference.startsWith('//') || reference.startsWith('#') || /^[a-z][a-z0-9+.-]*:/i.test(reference)) return null;
+  const clean = reference.split(/[?#]/)[0];
+  try { return decodeURIComponent(clean); } catch { return clean; }
+}
+
+async function copyLocalAssets(html, sourceFile, versionDir) {
+  const sourceDir = path.dirname(sourceFile);
+  const queue = localAssetReferences(html).map((reference) => ({ reference, baseDir: sourceDir }));
+  const visited = new Set();
+  let copied = 0;
+  while (queue.length) {
+    const { reference, baseDir } = queue.shift();
+    const local = safeLocalReference(reference);
+    if (!local) continue;
+    const source = path.resolve(baseDir, local);
+    const relative = path.relative(sourceDir, source);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative) || visited.has(source) || !(await exists(source))) continue;
+    visited.add(source);
+    const destination = path.resolve(versionDir, relative);
+    if (path.relative(versionDir, destination).startsWith('..')) continue;
+    await mkdir(path.dirname(destination), { recursive: true });
+    await cp(source, destination, { recursive: true, force: true });
+    copied += 1;
+    if (path.extname(source).toLowerCase() === '.css') {
+      const css = await readFile(source, 'utf8').catch(() => '');
+      queue.push(...localAssetReferences(css).map((cssReference) => ({ reference: cssReference, baseDir: path.dirname(source) })));
+    }
+  }
+  return copied;
+}
+
+async function readManifest(config, artifact) {
+  return readJson(manifestPath(config, artifact), {
+    schemaVersion: 1,
+    artifactId: artifact.id,
+    sourceFile: artifact.file,
+    title: artifact.title,
+    projectName: artifact.projectName,
+    versions: [],
+  });
+}
+
+async function snapshotArtifactNow(config, artifact, reason = 'scan') {
+  if (!config.archiveRoot || !artifact.exists) return null;
+  const html = await readFile(artifact.file, 'utf8');
+  const contentSha = sha256(html);
+  const manifest = await readManifest(config, artifact);
+  const latest = manifest.versions.at(-1);
+  if (latest?.sha256 === contentSha) return manifest;
+
+  const sourceStat = await stat(artifact.file);
+  const createdAt = new Date().toISOString();
+  const stamp = createdAt.replace(/[:.]/g, '-');
+  const versionId = `${stamp}-${contentSha.slice(0, 12)}`;
+  const versionDir = path.join(artifactArchiveDir(config, artifact), 'versions', versionId);
+  const archivedFile = path.join(versionDir, path.basename(artifact.file));
+  await mkdir(versionDir, { recursive: true });
+  await writeFile(archivedFile, html);
+  const assetsCopied = await copyLocalAssets(html, artifact.file, versionDir);
+
+  manifest.sourceFile = artifact.file;
+  manifest.title = artifact.title;
+  manifest.projectName = artifact.projectName;
+  manifest.versions.push({
+    id: versionId,
+    createdAt,
+    sourceModifiedAt: sourceStat.mtime.toISOString(),
+    sha256: contentSha,
+    size: Buffer.byteLength(html),
+    lineCount: html.split(/\r?\n/).length,
+    assetsCopied,
+    reason,
+    file: path.relative(artifactArchiveDir(config, artifact), archivedFile),
+  });
+  await writeJson(manifestPath(config, artifact), manifest);
+  return manifest;
+}
+
+function snapshotArtifact(config, artifact, reason = 'scan') {
+  const previous = snapshotQueues.get(artifact.id) || Promise.resolve();
+  const next = previous.then(() => snapshotArtifactNow(config, artifact, reason));
+  snapshotQueues.set(artifact.id, next.catch(() => {}));
+  return next;
+}
+
+function closeArtifactWatchers() {
+  for (const entry of artifactWatchers.values()) {
+    clearTimeout(entry.timer);
+    entry.watcher.close();
+  }
+  artifactWatchers.clear();
+}
+
+function syncArtifactWatchers(config, artifacts) {
+  if (!config.archiveRoot) return closeArtifactWatchers();
+  const targets = new Set(artifacts.filter((artifact) => artifact.exists).map((artifact) => artifact.file));
+  for (const [file, entry] of artifactWatchers) {
+    if (!targets.has(file) || entry.archiveRoot !== config.archiveRoot) {
+      clearTimeout(entry.timer);
+      entry.watcher.close();
+      artifactWatchers.delete(file);
+    }
+  }
+  for (const artifact of artifacts) {
+    if (!artifact.exists || artifactWatchers.has(artifact.file)) continue;
+    try {
+      const entry = { watcher: null, timer: null, archiveRoot: config.archiveRoot };
+      entry.watcher = watch(artifact.file, { persistent: false }, () => {
+        clearTimeout(entry.timer);
+        entry.timer = setTimeout(() => snapshotArtifact(config, artifact, 'change').catch(() => {}), 700);
+      });
+      entry.watcher.on('error', () => {
+        entry.watcher.close();
+        artifactWatchers.delete(artifact.file);
+      });
+      artifactWatchers.set(artifact.file, entry);
+    } catch { /* A periodic scan will retry files that cannot be watched. */ }
+  }
 }
 
 async function buildLibrary() {
@@ -132,23 +297,112 @@ async function buildLibrary() {
     const chatDates = Array.isArray(session?.chat) ? session.chat.map((item) => item.at).filter(Boolean) : [];
     const lastUsedAt = [session?.updated_at, ...chatDates].filter(Boolean).sort().at(-1) || null;
     artifacts.push({
-      id: idFor(file), projectId: project.id, title: metadata.title || fallbackTitle,
-      description: metadata.description, file,
+      id: idFor(file), projectId: project.id, projectName: project.name,
+      title: metadata.title || fallbackTitle, description: metadata.description, file,
       relativePath: project === looseProject ? file : path.relative(project.path, file),
-      modifiedAt: fileStat?.mtime?.toISOString() || null, lastUsedAt,
-      size: fileStat?.size || 0, exists: fileExists,
+      modifiedAt: fileStat?.mtime?.toISOString() || null, lastUsedAt, size: fileStat?.size || 0, exists: fileExists,
       sessionStatus: session?.status || 'discovered', pendingPrompts: Number(session?.pending_prompts || 0),
       url: session?.url || null, endedBy: session?.ended_by || null,
+      versionCount: 0, lastBackedUpAt: null, backupError: null,
     });
   }
 
+  let totalVersions = 0;
+  let protectedArtifacts = 0;
+  if (config.archiveRoot) {
+    for (const artifact of artifacts) {
+      if (!artifact.exists) continue;
+      try {
+        const manifest = await snapshotArtifact(config, artifact, 'scan');
+        artifact.versionCount = manifest?.versions.length || 0;
+        artifact.lastBackedUpAt = manifest?.versions.at(-1)?.createdAt || null;
+        totalVersions += artifact.versionCount;
+        if (artifact.versionCount > 0) protectedArtifacts += 1;
+      } catch (error) {
+        artifact.backupError = error instanceof Error ? error.message : 'Backup failed';
+      }
+    }
+  }
+  syncArtifactWatchers(config, artifacts);
+
   const projects = [...projectMap.values(), ...(hasLoose ? [looseProject] : [])].map((project) => ({
     ...project,
-    exists: project.exists,
     artifactCount: artifacts.filter((artifact) => artifact.projectId === project.id).length,
   })).filter((project) => project.artifactCount > 0 || project.source === 'added');
 
-  return { projects, artifacts, server: { running, url: 'http://127.0.0.1:4387' }, scannedAt: new Date().toISOString() };
+  return {
+    projects,
+    artifacts,
+    server: { running, url: 'http://127.0.0.1:4387' },
+    archive: {
+      enabled: Boolean(config.archiveRoot),
+      root: config.archiveRoot,
+      path: archiveHome(config),
+      totalVersions,
+      protectedArtifacts,
+    },
+    scannedAt: new Date().toISOString(),
+  };
+}
+
+async function artifactForFile(file) {
+  const resolved = path.resolve(String(file || ''));
+  if (!/\.html?$/i.test(resolved) || !(await exists(resolved))) throw new Error('That Lavish file no longer exists.');
+  const html = await readFile(resolved, 'utf8');
+  const metadata = metadataFromHtml(html);
+  const fallbackTitle = path.basename(resolved).replace(/\.html?$/i, '').replace(/[-_]+/g, ' ').replace(/\b\w/g, (letter) => letter.toUpperCase());
+  return { id: idFor(resolved), file: resolved, exists: true, title: metadata.title || fallbackTitle, projectName: projectNameFor(resolved) };
+}
+
+async function versionsFor(file) {
+  const config = await readConfig();
+  if (!config.archiveRoot) return { enabled: false, versions: [] };
+  const artifact = await artifactForFile(file);
+  const manifest = await readManifest(config, artifact);
+  const currentHtml = await readFile(artifact.file, 'utf8');
+  const currentSha = sha256(currentHtml);
+  const currentVersionIndex = manifest.versions.findLastIndex((version) => version.sha256 === currentSha);
+  const versions = manifest.versions.map((version, index) => {
+    const previous = manifest.versions[index - 1];
+    return {
+      ...version,
+      isCurrent: index === currentVersionIndex,
+      sizeDelta: previous ? version.size - previous.size : 0,
+      lineDelta: previous ? version.lineCount - previous.lineCount : 0,
+    };
+  }).reverse();
+  return { enabled: true, archivePath: artifactArchiveDir(config, artifact), sourceFile: artifact.file, versions };
+}
+
+async function resolveVersion(file, versionId) {
+  const config = await readConfig();
+  if (!config.archiveRoot) throw new Error('Choose an archive folder first.');
+  const artifact = await artifactForFile(file);
+  const manifest = await readManifest(config, artifact);
+  if (path.resolve(manifest.sourceFile) !== artifact.file) throw new Error('Archive manifest does not match this artifact.');
+  const version = manifest.versions.find((item) => item.id === versionId);
+  if (!version) throw new Error('That archived version could not be found.');
+  const artifactDir = artifactArchiveDir(config, artifact);
+  const archivedFile = path.resolve(artifactDir, version.file);
+  const relative = path.relative(artifactDir, archivedFile);
+  if (relative.startsWith('..') || path.isAbsolute(relative) || !(await exists(archivedFile))) throw new Error('That archived copy is missing.');
+  return { config, artifact, version, archivedFile };
+}
+
+async function restoreVersion(file, versionId) {
+  const resolved = await resolveVersion(file, versionId);
+  await snapshotArtifact(resolved.config, resolved.artifact, 'pre-restore');
+  const versionDir = path.dirname(resolved.archivedFile);
+  const sourceDir = path.dirname(resolved.artifact.file);
+  const entries = await readdir(versionDir, { withFileTypes: true });
+  for (const entry of entries) {
+    const source = path.join(versionDir, entry.name);
+    const destination = path.join(sourceDir, entry.name);
+    if (path.resolve(source) === path.resolve(resolved.archivedFile)) await copyFile(source, resolved.artifact.file);
+    else await cp(source, destination, { recursive: true, force: true });
+  }
+  await snapshotArtifact(resolved.config, resolved.artifact, 'restore');
+  return resolved;
 }
 
 function json(res, status, value, origin = '') {
@@ -177,9 +431,9 @@ async function addProject(folder) {
   return resolved;
 }
 
-function chooseFolder() {
+function chooseFolder(prompt) {
   return new Promise((resolve, reject) => {
-    const child = spawn('/usr/bin/osascript', ['-e', 'POSIX path of (choose folder with prompt "Choose a project to watch for Lavishes")']);
+    const child = spawn('/usr/bin/osascript', ['-e', `POSIX path of (choose folder with prompt ${JSON.stringify(prompt)})`]);
     let output = '';
     let errorOutput = '';
     child.stdout.on('data', (chunk) => { output += chunk; });
@@ -197,30 +451,70 @@ const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     if (req.method === 'GET' && url.pathname === '/api/library') return json(res, 200, await buildLibrary(), origin);
+    if (req.method === 'GET' && url.pathname === '/api/artifacts/versions') return json(res, 200, await versionsFor(url.searchParams.get('file')), origin);
     if (req.method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true, app: 'lavish-tracker' }, origin);
     if (req.method === 'POST' && url.pathname === '/api/projects') {
       const input = await body(req);
       return json(res, 201, { ok: true, path: await addProject(input.path) }, origin);
     }
     if (req.method === 'POST' && url.pathname === '/api/projects/choose') {
-      const chosen = await chooseFolder();
+      const chosen = await chooseFolder('Choose a project to watch for Lavishes');
       return json(res, 201, { ok: true, path: await addProject(chosen.replace(/\/$/, '')) }, origin);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/archive/choose') {
+      const chosen = await chooseFolder('Choose where Lavish Library should keep its archive');
+      const selected = path.resolve(chosen.replace(/\/$/, ''));
+      const config = await readConfig();
+      config.archiveRoot = selected;
+      await saveConfig(config);
+      return json(res, 201, { ok: true, root: selected, path: archiveHome(config) }, origin);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/archive/disable') {
+      const config = await readConfig();
+      config.archiveRoot = null;
+      await saveConfig(config);
+      closeArtifactWatchers();
+      return json(res, 200, { ok: true }, origin);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/archive/reveal') {
+      const config = await readConfig();
+      const folder = archiveHome(config);
+      if (!folder || !(await exists(folder))) throw new Error('No archive folder has been created yet.');
+      spawn('/usr/bin/open', [folder], { detached: true, stdio: 'ignore' }).unref();
+      return json(res, 202, { ok: true }, origin);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/artifacts/snapshot') {
+      const input = await body(req);
+      const config = await readConfig();
+      if (!config.archiveRoot) throw new Error('Choose an archive folder first.');
+      const artifact = await artifactForFile(input.file);
+      const manifest = await snapshotArtifact(config, artifact, 'manual');
+      return json(res, 201, { ok: true, versionCount: manifest?.versions.length || 0 }, origin);
     }
     if (req.method === 'POST' && url.pathname === '/api/artifacts/open') {
       const input = await body(req);
-      const file = path.resolve(String(input.file || ''));
-      if (!/\.html?$/i.test(file) || !(await exists(file))) return json(res, 404, { error: 'That Lavish file no longer exists.' }, origin);
-      const args = [file];
+      const artifact = await artifactForFile(input.file);
+      const args = [artifact.file];
       if (input.reopen) args.push('--reopen');
       spawn(LAVISH_BIN, args, { detached: true, stdio: 'ignore' }).unref();
       return json(res, 202, { ok: true }, origin);
     }
     if (req.method === 'POST' && url.pathname === '/api/artifacts/reveal') {
       const input = await body(req);
-      const file = path.resolve(String(input.file || ''));
-      if (!/\.html?$/i.test(file) || !(await exists(file))) return json(res, 404, { error: 'That Lavish file no longer exists.' }, origin);
-      spawn('/usr/bin/open', ['-R', file], { detached: true, stdio: 'ignore' }).unref();
+      const artifact = await artifactForFile(input.file);
+      spawn('/usr/bin/open', ['-R', artifact.file], { detached: true, stdio: 'ignore' }).unref();
       return json(res, 202, { ok: true }, origin);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/versions/open') {
+      const input = await body(req);
+      const resolved = await resolveVersion(input.file, input.versionId);
+      spawn('/usr/bin/open', [resolved.archivedFile], { detached: true, stdio: 'ignore' }).unref();
+      return json(res, 202, { ok: true }, origin);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/versions/restore') {
+      const input = await body(req);
+      const restored = await restoreVersion(input.file, input.versionId);
+      return json(res, 200, { ok: true, restoredAt: new Date().toISOString(), versionId: restored.version.id }, origin);
     }
     return json(res, 404, { error: 'Not found.' }, origin);
   } catch (error) {
@@ -228,4 +522,6 @@ const server = createServer(async (req, res) => {
   }
 });
 
+const periodicScan = setInterval(() => buildLibrary().catch(() => {}), 30_000);
+periodicScan.unref();
 server.listen(PORT, HOST, () => console.log(`Lavish Tracker library service: http://${HOST}:${PORT}`));
