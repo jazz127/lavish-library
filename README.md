@@ -45,11 +45,18 @@ The first scan creates a baseline. While the app is running, watched files are b
 
 ## Run it
 
-Requires Node.js 22.13 or newer and `lavish-axi` installed at `/opt/homebrew/bin/lavish-axi`.
+Requires Node.js 22.13 or newer and the [`lavish-axi` CLI](https://github.com/kunchenguid/lavish-axi#session-hook). Install Lavish globally, then install this project's dependencies:
 
 ```bash
+npm install -g lavish-axi
 npm install
 npm run dev
+```
+
+The app expects Lavish at `/opt/homebrew/bin/lavish-axi` by default. If `command -v lavish-axi` reports another location, pass it when starting the app:
+
+```bash
+LAVISH_AXI_BIN="$(command -v lavish-axi)" npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000). The library refreshes when the page loads and whenever you press the refresh button.
