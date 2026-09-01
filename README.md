@@ -15,8 +15,27 @@ A private, local-first browser library for finding and reopening Lavish review s
 - Creates content-addressed snapshots whenever a watched Lavish changes
 - Copies each HTML file and its linked local assets into a chosen archive folder
 - Shows an artifact timeline with size/line deltas, archived previews, and safe restore
+- Records local searches, opens, reveals, restores, feedback, and outcomes from v0.2 onward
+- Classifies recurring topics and artifact shapes without uploading content
+- Combines Lavish sessions, protected versions, local interactions, and project Git activity into a plan-evolution timeline
+- Provides a Signal Observatory, periodic Lavish Review, dormant gems, template candidates, and an explainable recommendation queue
+- Lets you tune on-demand, weekly, monthly, and contextual reflection prompts
 
-All project paths and preferences stay on the Mac in `~/.lavish-tracker/config.json`. Nothing is uploaded by the app.
+All project paths and preferences stay on the Mac in `~/.lavish-tracker/config.json`. Insights and feedback stay in `~/.lavish-tracker/analytics.json`. Nothing is uploaded by the app, and foreground-time tracking is deliberately excluded.
+
+## Insights
+
+Choose **Insights** in the sidebar to move between two complementary views:
+
+- **Signal Observatory** shows the evidence: activity, repeat-use signals, topic shelves, searches, recurring Lavish shapes, and the evolving timeline of versions, sessions, restores, feedback, and Git commits.
+- **Lavish Review** turns that evidence into a calm narrative, an actionable recommendation queue, dormant work worth revisiting, possible templates, and quick value/outcome labels.
+
+The app distinguishes recorded evidence from unknown history. It can backfill file dates, known Lavish sessions, protected versions, and local Git commits; searches and library interactions begin recording with v0.2.
+
+## Versions
+
+- `v0.1.0` — local Lavish library and protected version archive
+- `v0.2.0` — Signal Observatory, Lavish Review, feedback, recommendations, and plan evolution
 
 ## Version archive
 

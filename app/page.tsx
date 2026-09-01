@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
+import InsightsView from './insights-view';
 
 type Project = {
   id: string;
@@ -26,6 +27,7 @@ type Artifact = {
   pendingPrompts: number;
   url: string | null;
   endedBy: 'user' | 'agent' | null;
+  sessionMessages: number;
   versionCount: number;
   lastBackedUpAt: string | null;
   backupError: string | null;
@@ -114,6 +116,7 @@ export default function Home() {
   const [sort, setSort] = useState<SortMode>('recent');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [view, setView] = useState<'grid' | 'list'>('grid');
+  const [section, setSection] = useState<'library' | 'insights'>('library');
   const [loading, setLoading] = useState(true);
   const [notice, setNotice] = useState('');
   const [manualPath, setManualPath] = useState('');
@@ -123,6 +126,7 @@ export default function Home() {
   const [history, setHistory] = useState<VersionHistory | null>(null);
   const [historyLoading, setHistoryLoading] = useState(false);
   const searchRef = useRef<HTMLInputElement>(null);
+  const trackedSearchRef = useRef('');
 
   async function loadLibrary(quiet = false) {
     if (!quiet) setLoading(true);
@@ -157,7 +161,8 @@ export default function Home() {
     const handleShortcut = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'k') {
         event.preventDefault();
-        searchRef.current?.focus();
+        setSection('library');
+        window.setTimeout(() => searchRef.current?.focus(), 0);
       }
     };
     window.addEventListener('keydown', handleShortcut);
@@ -181,6 +186,28 @@ export default function Home() {
     });
     return items;
   }, [library, query, selectedProject, sort, statusFilter]);
+
+  useEffect(() => {
+    const normalized = query.trim().toLowerCase();
+    if (section !== 'library' || normalized.length < 2 || trackedSearchRef.current === normalized) return;
+    const timer = window.setTimeout(() => {
+      trackedSearchRef.current = normalized;
+      void fetch(`${API}/events`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ type: 'search', query: query.trim(), resultCount: artifacts.length, projectId: selectedProject }),
+      });
+    }, 750);
+    return () => window.clearTimeout(timer);
+  }, [artifacts.length, query, section, selectedProject]);
+
+  function selectProject(projectId: string) {
+    setSection('library');
+    setSelectedProject(projectId);
+    void fetch(`${API}/events`, {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ type: 'project_view', projectId }),
+    });
+  }
 
   async function chooseFolder() {
     setNotice('Opening the folder picker…');
@@ -219,7 +246,7 @@ export default function Home() {
       const response = await fetch(`${API}/artifacts/open`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ file: artifact.file, reopen: artifact.sessionStatus === 'ended' && artifact.endedBy === 'user' }),
+        body: JSON.stringify({ file: artifact.file, reopen: artifact.sessionStatus === 'ended' && artifact.endedBy === 'user', query: query.trim() || null }),
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || 'Lavish could not be opened.');
@@ -357,11 +384,14 @@ export default function Home() {
 
         <nav aria-label="Library navigation">
           <p className="nav-label">Library</p>
-          <button className={`nav-item ${selectedProject === 'all' ? 'active' : ''}`} onClick={() => setSelectedProject('all')}>
+          <button className={`nav-item ${section === 'library' && selectedProject === 'all' ? 'active' : ''}`} onClick={() => selectProject('all')}>
             <Icon name="grid" /><span>All lavishes</span><small>{library?.artifacts.length ?? '—'}</small>
           </button>
+          <button className={`nav-item ${section === 'insights' ? 'active' : ''}`} onClick={() => setSection('insights')}>
+            <span className="nav-insight-glyph">◎</span><span>Insights</span><small>NEW</small>
+          </button>
           <div className="nav-item muted" aria-label={`${liveCount} known sessions`}><span className="live-dot" /><span>Known sessions</span><small>{liveCount}</small></div>
-          <button className={`nav-item ${showArchive ? 'active' : ''}`} onClick={() => setShowArchive((value) => !value)}>
+          <button className={`nav-item ${section === 'library' && showArchive ? 'active' : ''}`} onClick={() => { setSection('library'); setShowArchive((value) => !value); }}>
             <Icon name="archive" /><span>Version archive</span><small>{library?.archive?.totalVersions ?? '—'}</small>
           </button>
 
@@ -371,7 +401,7 @@ export default function Home() {
           </div>
           <div className="project-list">
             {library?.projects.map((project) => (
-              <button key={project.id} className={`nav-item ${selectedProject === project.id ? 'active' : ''}`} onClick={() => setSelectedProject(project.id)} title={project.path}>
+              <button key={project.id} className={`nav-item ${section === 'library' && selectedProject === project.id ? 'active' : ''}`} onClick={() => selectProject(project.id)} title={project.path}>
                 <span className="project-glyph">{project.name.slice(0, 1).toUpperCase()}</span><span>{project.name}</span><small>{project.artifactCount}</small>
               </button>
             ))}
@@ -389,17 +419,22 @@ export default function Home() {
 
       <section className="workspace">
         <header className="topbar">
-          <label className="search-box">
-            <Icon name="search" />
-            <input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search lavishes, projects, or paths…" />
-            <kbd>⌘ K</kbd>
-          </label>
-          <button className="icon-button" aria-label="Refresh library" onClick={() => void loadLibrary()}><Icon name="refresh" /></button>
-          <button className={`archive-button ${library?.archive?.enabled ? 'enabled' : ''}`} onClick={() => setShowArchive((value) => !value)}><Icon name="archive" /> {library?.archive?.enabled ? `${library.archive.totalVersions} versions` : 'Set up archive'}</button>
-          <button className="add-button" onClick={() => setShowAdd((value) => !value)}><Icon name="plus" /> Add folder</button>
+          {section === 'library' ? <>
+            <label className="search-box">
+              <Icon name="search" />
+              <input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search lavishes, projects, or paths…" />
+              <kbd>⌘ K</kbd>
+            </label>
+            <button className="icon-button" aria-label="Refresh library" onClick={() => void loadLibrary()}><Icon name="refresh" /></button>
+            <button className={`archive-button ${library?.archive?.enabled ? 'enabled' : ''}`} onClick={() => setShowArchive((value) => !value)}><Icon name="archive" /> {library?.archive?.enabled ? `${library.archive.totalVersions} versions` : 'Set up archive'}</button>
+            <button className="add-button" onClick={() => setShowAdd((value) => !value)}><Icon name="plus" /> Add folder</button>
+          </> : <>
+            <div className="insights-topbar-copy"><strong>Insights</strong><span>Local evidence · no foreground-time tracking</span></div>
+            <button className="archive-button enabled" onClick={() => setSection('library')}><Icon name="grid" /> Back to library</button>
+          </>}
         </header>
 
-        {showArchive && (
+        {section === 'library' && showArchive && (
           <section className="archive-panel" aria-label="Version archive settings">
             <div className="archive-panel-copy">
               <div className="archive-emblem"><Icon name="archive" /></div>
@@ -417,7 +452,7 @@ export default function Home() {
           </section>
         )}
 
-        {showAdd && (
+        {section === 'library' && showAdd && (
           <section className="add-panel" aria-label="Add a project folder">
             <div><strong>Add a project folder</strong><p>We’ll look inside its <code>.lavish</code> folders. Nothing is uploaded.</p></div>
             <button className="choose-button" onClick={() => void chooseFolder()}><Icon name="folder" /> Choose folder</button>
@@ -428,7 +463,7 @@ export default function Home() {
           </section>
         )}
 
-        <div className="content">
+        {section === 'insights' ? <InsightsView /> : <div className="content">
           <div className="eyebrow"><Icon name="spark" /> YOUR CREATIVE ARCHIVE</div>
           <div className="title-row">
             <div>
@@ -478,7 +513,7 @@ export default function Home() {
               })}
             </div>
           )}
-        </div>
+        </div>}
       </section>
 
       {historyArtifact && (

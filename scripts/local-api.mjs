@@ -11,12 +11,17 @@ const HOST = '127.0.0.1';
 const STATE_FILE = process.env.LAVISH_AXI_STATE_DIR
   ? path.join(process.env.LAVISH_AXI_STATE_DIR, 'state.json')
   : path.join(os.homedir(), '.lavish-axi', 'state.json');
-const CONFIG_DIR = path.join(os.homedir(), '.lavish-tracker');
+const CONFIG_DIR = process.env.LAVISH_TRACKER_CONFIG_DIR
+  ? path.resolve(process.env.LAVISH_TRACKER_CONFIG_DIR)
+  : path.join(os.homedir(), '.lavish-tracker');
 const CONFIG_FILE = path.join(CONFIG_DIR, 'config.json');
+const ANALYTICS_FILE = path.join(CONFIG_DIR, 'analytics.json');
 const LAVISH_BIN = process.env.LAVISH_AXI_BIN || '/opt/homebrew/bin/lavish-axi';
 const ARCHIVE_NAME = 'Lavish Library Archive';
 const artifactWatchers = new Map();
 const snapshotQueues = new Map();
+let analyticsQueue = Promise.resolve();
+let gitCache = { at: 0, value: [] };
 
 const idFor = (value) => createHash('sha1').update(value).digest('hex').slice(0, 12);
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
@@ -45,6 +50,70 @@ async function readConfig() {
 async function saveConfig(config) {
   await mkdir(CONFIG_DIR, { recursive: true });
   await writeJson(CONFIG_FILE, config);
+}
+
+function analyticsDefaults() {
+  return {
+    schemaVersion: 1,
+    events: [],
+    feedback: {},
+    recommendationState: {},
+    settings: {
+      cadence: 'tunable',
+      manual: true,
+      weekly: true,
+      monthly: true,
+      contextual: true,
+      foregroundTime: false,
+    },
+  };
+}
+
+async function readAnalytics() {
+  const fallback = analyticsDefaults();
+  const value = await readJson(ANALYTICS_FILE, fallback);
+  return {
+    ...fallback,
+    ...value,
+    events: Array.isArray(value.events) ? value.events : [],
+    feedback: value.feedback && typeof value.feedback === 'object' ? value.feedback : {},
+    recommendationState: value.recommendationState && typeof value.recommendationState === 'object' ? value.recommendationState : {},
+    settings: { ...fallback.settings, ...(value.settings || {}), foregroundTime: false },
+  };
+}
+
+function updateAnalytics(mutator) {
+  analyticsQueue = analyticsQueue.catch(() => {}).then(async () => {
+    const analytics = await readAnalytics();
+    const result = await mutator(analytics);
+    analytics.events = analytics.events.slice(-10_000);
+    await writeJson(ANALYTICS_FILE, analytics);
+    return result;
+  });
+  return analyticsQueue;
+}
+
+function cleanEventValue(value, max = 240) {
+  return typeof value === 'string' ? value.trim().slice(0, max) : '';
+}
+
+async function recordEvent(type, details = {}) {
+  const allowed = new Set(['search', 'open', 'reveal', 'snapshot', 'version_open', 'restore', 'project_view', 'insights_open', 'review_open', 'feedback', 'recommendation']);
+  if (!allowed.has(type)) throw new Error('Unknown analytics event.');
+  const at = new Date().toISOString();
+  const event = {
+    id: idFor(`${at}:${type}:${Math.random()}`),
+    at,
+    type,
+    artifactId: cleanEventValue(details.artifactId, 40) || null,
+    projectId: cleanEventValue(details.projectId, 40) || null,
+    query: cleanEventValue(details.query, 160) || null,
+    resultCount: Number.isFinite(details.resultCount) ? Math.max(0, Math.round(details.resultCount)) : null,
+    label: cleanEventValue(details.label, 120) || null,
+    detail: cleanEventValue(details.detail, 300) || null,
+  };
+  await updateAnalytics((analytics) => { analytics.events.push(event); });
+  return event;
 }
 
 function archiveHome(config) {
@@ -303,6 +372,7 @@ async function buildLibrary() {
       modifiedAt: fileStat?.mtime?.toISOString() || null, lastUsedAt, size: fileStat?.size || 0, exists: fileExists,
       sessionStatus: session?.status || 'discovered', pendingPrompts: Number(session?.pending_prompts || 0),
       url: session?.url || null, endedBy: session?.ended_by || null,
+      sessionMessages: Array.isArray(session?.chat) ? session.chat.length : 0,
       versionCount: 0, lastBackedUpAt: null, backupError: null,
     });
   }
@@ -405,6 +475,257 @@ async function restoreVersion(file, versionId) {
   return resolved;
 }
 
+const PURPOSES = [
+  ['Implementation plan', /\b(implementation|rollout|delivery|deployment|migration|plan)\b/i],
+  ['Architecture review', /\b(architecture|design|topology|infrastructure)\b/i],
+  ['Assessment', /\b(assessment|readiness|reconciliation|audit|diagnostic|analysis)\b/i],
+  ['Runbook or guide', /\b(runbook|guide|procedure|playbook|how[- ]?to)\b/i],
+  ['Comparison', /\b(comparison|versus|\bvs\b|options|tradeoffs?)\b/i],
+  ['Status update', /\b(status|update|brief|summary|report|dashboard)\b/i],
+  ['Retrospective', /\b(retrospective|postmortem|lessons?|outcomes?|what happened)\b/i],
+  ['Proposal', /\b(proposal|strategy|recommendation|decision)\b/i],
+];
+
+const STOPWORDS = new Set('a an and are as at be been by can codex could do for from has have html how in into is it lavish library local more of on only or our out page project read should site some than that the their this to tool use using was we what when where which who will with you your analysis architecture assessment audit august april comparison content current dashboard december deployment design diagnostic february feedback guide implementation january july june live march may migration november october options plan playbook private procedure proposal readiness reconciliation report review rollout runbook september status strategy summary update'.split(' '));
+
+function purposeFor(artifact) {
+  const text = `${artifact.title} ${artifact.description} ${artifact.relativePath}`;
+  return PURPOSES.find(([, pattern]) => pattern.test(text))?.[0] || 'Other knowledge work';
+}
+
+function topicTokens(artifact) {
+  const source = `${artifact.title} ${artifact.description}`.toLowerCase().replace(/[^a-z0-9+#.-]+/g, ' ');
+  return [...new Set(source.split(/\s+/).map((item) => item.replace(/^[+.#-]+|[+.#-]+$/g, '')).filter((item) => item.length >= 4 && item.length <= 28 && !STOPWORDS.has(item) && !/^\d+$/.test(item)))].slice(0, 14);
+}
+
+function titleCase(value) {
+  const acronyms = new Set(['ad', 'api', 'azure', 'dns', 'entra', 'hyperv', 'mcp', 'ssa']);
+  return value.split(/[-_ ]+/).map((part) => acronyms.has(part) ? part.toUpperCase() : `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`).join(' ');
+}
+
+function runCommand(command, args, timeout = 3500) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    let output = '';
+    const timer = setTimeout(() => child.kill('SIGTERM'), timeout);
+    child.stdout.on('data', (chunk) => { output += chunk; });
+    child.on('close', (code) => { clearTimeout(timer); resolve(code === 0 ? output : ''); });
+    child.on('error', () => { clearTimeout(timer); resolve(''); });
+  });
+}
+
+async function gitActivityForProjects(projects) {
+  if (Date.now() - gitCache.at < 60_000) return gitCache.value;
+  const groups = await Promise.all(projects.filter((project) => project.exists && path.isAbsolute(project.path)).map(async (project) => {
+    const output = await runCommand('/usr/bin/git', ['-C', project.path, 'log', '--since=120 days ago', '--max-count=80', '--format=%ct%x09%h%x09%s']);
+    return output.split(/\r?\n/).filter(Boolean).map((line) => {
+      const [timestamp, hash, ...subject] = line.split('\t');
+      return { id: `git-${project.id}-${hash}`, at: new Date(Number(timestamp) * 1000).toISOString(), type: 'git', title: project.name, label: `Commit ${hash}`, detail: subject.join(' ').slice(0, 220), projectId: project.id, artifactId: null };
+    });
+  }));
+  gitCache = { at: Date.now(), value: groups.flat().sort((a, b) => b.at.localeCompare(a.at)).slice(0, 160) };
+  return gitCache.value;
+}
+
+function recommendationStateVisible(state) {
+  if (!state) return true;
+  if (state.status === 'dismissed' || state.status === 'done') return false;
+  if (state.status === 'snoozed' && state.until && new Date(state.until).getTime() > Date.now()) return false;
+  return true;
+}
+
+async function buildInsights(days = 90) {
+  const safeDays = Number.isFinite(days) ? Math.max(1, Math.min(3650, days)) : 90;
+  const [library, analytics, config] = await Promise.all([buildLibrary(), readAnalytics(), readConfig()]);
+  const cutoff = Date.now() - safeDays * 86_400_000;
+  const events = analytics.events.filter((event) => new Date(event.at).getTime() >= cutoff);
+  const artifactById = new Map(library.artifacts.map((artifact) => [artifact.id, artifact]));
+  const openCounts = new Map();
+  const searchClickCounts = new Map();
+  for (const event of events) {
+    if (event.artifactId && event.type === 'open') openCounts.set(event.artifactId, (openCounts.get(event.artifactId) || 0) + 1);
+    if (event.artifactId && event.type === 'open' && event.query) searchClickCounts.set(event.artifactId, (searchClickCounts.get(event.artifactId) || 0) + 1);
+  }
+
+  const classified = library.artifacts.map((artifact) => {
+    const feedback = analytics.feedback[artifact.id] || null;
+    const lastActivityAt = [artifact.lastUsedAt, artifact.modifiedAt, artifact.lastBackedUpAt, feedback?.updatedAt].filter(Boolean).sort().at(-1) || null;
+    return {
+      ...artifact,
+      purpose: purposeFor(artifact),
+      topics: topicTokens(artifact),
+      trackedOpens: openCounts.get(artifact.id) || 0,
+      searchClicks: searchClickCounts.get(artifact.id) || 0,
+      feedback,
+      lastActivityAt,
+    };
+  });
+
+  const topicMap = new Map();
+  for (const artifact of classified) {
+    for (const topic of artifact.topics) {
+      const entry = topicMap.get(topic) || { id: topic, name: titleCase(topic), artifactIds: [], repeatUse: 0, versions: 0, sessionReplies: 0 };
+      entry.artifactIds.push(artifact.id);
+      entry.repeatUse += artifact.trackedOpens > 1 || artifact.versionCount > 1 || artifact.sessionMessages > 1 ? 1 : 0;
+      entry.versions += artifact.versionCount;
+      entry.sessionReplies += artifact.sessionMessages;
+      topicMap.set(topic, entry);
+    }
+  }
+  const topics = [...topicMap.values()].filter((topic) => topic.artifactIds.length >= 2).sort((a, b) => b.artifactIds.length - a.artifactIds.length || b.repeatUse - a.repeatUse).slice(0, 18).map((topic) => ({
+    ...topic,
+    count: topic.artifactIds.length,
+    examples: topic.artifactIds.slice(0, 3).map((id) => artifactById.get(id)?.title).filter(Boolean),
+  }));
+
+  const purposeMap = new Map();
+  for (const artifact of classified) {
+    const entry = purposeMap.get(artifact.purpose) || { name: artifact.purpose, artifacts: [], repeatUse: 0, versions: 0, sessionReplies: 0 };
+    entry.artifacts.push(artifact);
+    entry.repeatUse += artifact.trackedOpens > 1 || artifact.versionCount > 1 || artifact.sessionMessages > 1 ? 1 : 0;
+    entry.versions += artifact.versionCount;
+    entry.sessionReplies += artifact.sessionMessages;
+    purposeMap.set(artifact.purpose, entry);
+  }
+  const purposes = [...purposeMap.values()].sort((a, b) => b.artifacts.length - a.artifacts.length).map((entry) => ({
+    name: entry.name,
+    count: entry.artifacts.length,
+    repeatUse: entry.repeatUse,
+    versions: entry.versions,
+    sessionReplies: entry.sessionReplies,
+    examples: entry.artifacts.slice(0, 3).map((artifact) => artifact.title),
+  }));
+
+  const searchMap = new Map();
+  for (const event of events.filter((event) => event.type === 'search' && event.query)) {
+    const key = event.query.toLowerCase();
+    const entry = searchMap.get(key) || { query: event.query, count: 0, zeroResultCount: 0, totalResults: 0, lastSearchedAt: event.at };
+    entry.count += 1;
+    entry.zeroResultCount += event.resultCount === 0 ? 1 : 0;
+    entry.totalResults += event.resultCount || 0;
+    if (event.at > entry.lastSearchedAt) entry.lastSearchedAt = event.at;
+    searchMap.set(key, entry);
+  }
+  const searches = [...searchMap.values()].sort((a, b) => b.count - a.count || b.lastSearchedAt.localeCompare(a.lastSearchedAt)).slice(0, 20).map((entry) => ({ ...entry, averageResults: Math.round(entry.totalResults / entry.count) }));
+
+  const valuable = classified.filter((artifact) => artifact.versionCount > 1 || artifact.sessionMessages > 0 || artifact.feedback?.value === 'useful' || artifact.feedback?.outcome);
+  const dormant = valuable.filter((artifact) => !artifact.lastActivityAt || new Date(artifact.lastActivityAt).getTime() < Date.now() - 30 * 86_400_000).sort((a, b) => (b.versionCount + b.sessionMessages) - (a.versionCount + a.sessionMessages)).slice(0, 10).map((artifact) => ({
+    id: artifact.id,
+    title: artifact.title,
+    projectName: artifact.projectName,
+    file: artifact.file,
+    lastActivityAt: artifact.lastActivityAt,
+    reason: artifact.feedback?.value === 'useful' ? 'You marked this useful' : artifact.sessionMessages ? `${artifact.sessionMessages} known session replies` : `${artifact.versionCount} protected versions`,
+  }));
+
+  const templateCandidates = purposes.filter((purpose) => purpose.count >= 2 && purpose.name !== 'Other knowledge work').slice(0, 8).map((purpose) => ({
+    id: slug(purpose.name),
+    name: purpose.name,
+    count: purpose.count,
+    confidence: purpose.count >= 6 ? 'High' : purpose.count >= 3 ? 'Medium' : 'Early',
+    evidence: `${purpose.repeatUse} show repeat-use signals · ${purpose.versions} protected versions`,
+    examples: purpose.examples,
+  }));
+
+  const versionEvents = [];
+  if (config.archiveRoot) {
+    for (const artifact of classified) {
+      if (!artifact.versionCount) continue;
+      const manifest = await readManifest(config, artifact).catch(() => null);
+      if (!manifest) continue;
+      manifest.versions.forEach((version, index) => {
+        const previous = manifest.versions[index - 1];
+        const lineDelta = previous ? version.lineCount - previous.lineCount : 0;
+        versionEvents.push({
+          id: `version-${artifact.id}-${version.id}`,
+          at: version.createdAt,
+          type: 'version',
+          title: artifact.title,
+          label: index === 0 ? 'Baseline protected' : version.reason === 'restore' ? 'Version restored' : 'Revision protected',
+          detail: `${lineDelta > 0 ? '+' : ''}${lineDelta} lines · ${version.assetsCopied} local assets`,
+          projectId: artifact.projectId,
+          artifactId: artifact.id,
+        });
+      });
+    }
+  }
+  const interactionEvents = events.filter((event) => event.type !== 'search').map((event) => {
+    const artifact = artifactById.get(event.artifactId);
+    return { ...event, title: artifact?.title || event.label || 'Lavish Library', label: event.label || titleCase(event.type), detail: event.detail || artifact?.projectName || '' };
+  });
+  const sessionEvents = classified.filter((artifact) => artifact.lastUsedAt).map((artifact) => ({
+    id: `session-${artifact.id}-${artifact.lastUsedAt}`,
+    at: artifact.lastUsedAt,
+    type: 'session',
+    title: artifact.title,
+    label: artifact.sessionMessages ? `Session activity · ${artifact.sessionMessages} replies` : 'Lavish session activity',
+    detail: artifact.projectName,
+    projectId: artifact.projectId,
+    artifactId: artifact.id,
+  }));
+  const gitEvents = await gitActivityForProjects(library.projects);
+  const evolution = [...versionEvents, ...interactionEvents, ...sessionEvents, ...gitEvents].filter((event) => new Date(event.at).getTime() >= cutoff).sort((a, b) => b.at.localeCompare(a.at)).slice(0, 80);
+
+  const planCount = purposeMap.get('Implementation plan')?.artifacts.length || 0;
+  const retrospectiveCount = purposeMap.get('Retrospective')?.artifacts.length || 0;
+  const zeroSearch = searches.find((search) => search.zeroResultCount > 0);
+  const topTopic = topics[0];
+  const topPurpose = purposes[0];
+  const labelledCount = Object.keys(analytics.feedback).length;
+  const rawRecommendations = [
+    dormant.length ? { id: 'review-dormant', kind: 'Resurface', title: `Revisit ${dormant.length} dormant ${dormant.length === 1 ? 'gem' : 'gems'}`, description: 'These Lavishes accumulated revisions or feedback, then fell quiet.', evidence: dormant.slice(0, 3).map((item) => item.title).join(' · '), confidence: 'High' } : null,
+    topTopic ? { id: `curate-${topTopic.id}`, kind: 'Curate', title: `Create a ${topTopic.name} shelf`, description: 'This topic recurs across projects and deserves a reliable home.', evidence: `${topTopic.count} Lavishes · ${topTopic.repeatUse} with repeat-use signals`, confidence: topTopic.count >= 5 ? 'High' : 'Medium' } : null,
+    templateCandidates[0] ? { id: `template-${templateCandidates[0].id}`, kind: 'Template', title: `Harvest a ${templateCandidates[0].name.toLowerCase()} template`, description: 'A repeated shape is emerging from work you already produce.', evidence: templateCandidates[0].evidence, confidence: templateCandidates[0].confidence } : null,
+    planCount >= Math.max(3, retrospectiveCount * 3) ? { id: 'reflect-on-plans', kind: 'Experiment', title: 'Close one planning loop', description: 'Plans substantially outnumber outcome reflections. Pick one shipped plan and record what proved true.', evidence: `${planCount} planning artifacts · ${retrospectiveCount} retrospectives`, confidence: 'Medium' } : null,
+    zeroSearch ? { id: `search-gap-${slug(zeroSearch.query)}`, kind: 'Findability', title: `Resolve the “${zeroSearch.query}” search gap`, description: 'At least one search returned no useful candidates.', evidence: `${zeroSearch.zeroResultCount} zero-result ${zeroSearch.zeroResultCount === 1 ? 'search' : 'searches'}`, confidence: 'High' } : null,
+    labelledCount < Math.min(8, classified.length) ? { id: 'teach-value', kind: 'Feedback', title: 'Teach Lavish what “valuable” means', description: 'Label a few representative artifacts so recommendations learn from outcomes, not attention alone.', evidence: `${labelledCount} of ${classified.length} Lavishes labelled`, confidence: 'High' } : null,
+  ].filter(Boolean);
+  const recommendations = rawRecommendations.filter((item) => recommendationStateVisible(analytics.recommendationState[item.id])).map((item) => ({ ...item, state: analytics.recommendationState[item.id] || null }));
+
+  const active30d = classified.filter((artifact) => artifact.lastActivityAt && new Date(artifact.lastActivityAt).getTime() >= Date.now() - 30 * 86_400_000).length;
+  const repeatArtifacts = classified.filter((artifact) => artifact.trackedOpens > 1 || artifact.versionCount > 1 || artifact.sessionMessages > 1).length;
+  const sessionReplies = classified.reduce((sum, artifact) => sum + artifact.sessionMessages, 0);
+  const outcomes = classified.filter((artifact) => artifact.feedback?.outcome).length;
+  const topSentence = topPurpose ? `${topPurpose.name} is your most common Lavish shape` : 'Your library is ready to reveal its strongest patterns';
+  const lastReviewedAt = analytics.events.filter((event) => event.type === 'review_open').sort((a, b) => b.at.localeCompare(a.at))[0]?.at || null;
+  const scheduledIntervals = [analytics.settings.weekly ? 7 : null, analytics.settings.monthly ? 30 : null].filter(Boolean);
+  const nextDueAt = lastReviewedAt && scheduledIntervals.length ? new Date(new Date(lastReviewedAt).getTime() + Math.min(...scheduledIntervals) * 86_400_000).toISOString() : null;
+  const newestEvidenceAt = evolution[0]?.at || null;
+  const reasons = [];
+  if (!lastReviewedAt && (analytics.settings.weekly || analytics.settings.monthly || analytics.settings.contextual)) reasons.push('Your first review is ready');
+  if (nextDueAt && new Date(nextDueAt).getTime() <= Date.now()) reasons.push('A scheduled reflection is due');
+  if (analytics.settings.contextual && newestEvidenceAt && (!lastReviewedAt || newestEvidenceAt > lastReviewedAt)) reasons.push('New revisions or activity are available');
+  const review = {
+    headline: `${topSentence}.`,
+    lede: topPurpose
+      ? `${topPurpose.count} artifacts fit this pattern, with ${topPurpose.repeatUse} showing repeat-use signals. The most useful next step is to connect that attention to explicit outcomes as your plans evolve.`
+      : 'Usage evidence will become more useful as you search, revisit, revise, and label outcomes.',
+    highlights: [
+      topTopic ? { title: `${topTopic.name} keeps surfacing`, detail: `${topTopic.count} Lavishes across the library; ${topTopic.repeatUse} show repeat-use signals.`, tone: 'signal' } : null,
+      dormant.length ? { title: `${dormant.length} strong artifacts have gone quiet`, detail: 'They have revisions or feedback, but no recent activity. That may mean “finished,” not “failed.”', tone: 'dormant' } : null,
+      planCount ? { title: 'Plans can now tell their own story', detail: `${versionEvents.length} archived revision events and ${gitEvents.length} recent Git events can form an evidence timeline.`, tone: 'evolution' } : null,
+    ].filter(Boolean),
+    status: { due: reasons.length > 0, reasons: [...new Set(reasons)], lastReviewedAt, nextDueAt, newestEvidenceAt },
+  };
+
+  return {
+    generatedAt: new Date().toISOString(),
+    rangeDays: safeDays,
+    privacy: { localOnly: true, foregroundTime: false, signals: ['Library interactions', 'Lavish session events', 'Local content classification', 'Git and outcome links'] },
+    settings: analytics.settings,
+    summary: { totalArtifacts: classified.length, active30d, repeatArtifacts, sessionReplies, versions: library.archive.totalVersions, outcomes, trackedSearches: events.filter((event) => event.type === 'search').length },
+    topics,
+    purposes,
+    searches,
+    dormant,
+    templateCandidates,
+    recommendations,
+    evolution,
+    review,
+    feedbackQueue: classified.filter((artifact) => !artifact.feedback).sort((a, b) => new Date(b.lastActivityAt || 0) - new Date(a.lastActivityAt || 0)).slice(0, 8).map((artifact) => ({ id: artifact.id, file: artifact.file, title: artifact.title, projectName: artifact.projectName, lastActivityAt: artifact.lastActivityAt })),
+  };
+}
+
 function json(res, status, value, origin = '') {
   const headers = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
   if (/^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(origin)) headers['access-control-allow-origin'] = origin;
@@ -451,11 +772,62 @@ const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     if (req.method === 'GET' && url.pathname === '/api/library') return json(res, 200, await buildLibrary(), origin);
+    if (req.method === 'GET' && url.pathname === '/api/insights') return json(res, 200, await buildInsights(Number(url.searchParams.get('days') || 90)), origin);
     if (req.method === 'GET' && url.pathname === '/api/artifacts/versions') return json(res, 200, await versionsFor(url.searchParams.get('file')), origin);
     if (req.method === 'GET' && url.pathname === '/health') return json(res, 200, { ok: true, app: 'lavish-tracker' }, origin);
     if (req.method === 'POST' && url.pathname === '/api/projects') {
       const input = await body(req);
       return json(res, 201, { ok: true, path: await addProject(input.path) }, origin);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/events') {
+      const input = await body(req);
+      const event = await recordEvent(input.type, input);
+      return json(res, 201, { ok: true, event }, origin);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/artifacts/feedback') {
+      const input = await body(req);
+      const artifact = await artifactForFile(input.file);
+      const values = new Set(['useful', 'unfinished', 'disposable']);
+      const outcomes = new Set(['decided', 'shipped', 'shared', 'reused', 'abandoned', 'none']);
+      const value = values.has(input.value) ? input.value : null;
+      const outcome = outcomes.has(input.outcome) && input.outcome !== 'none' ? input.outcome : null;
+      const note = cleanEventValue(input.note, 800) || null;
+      const feedback = await updateAnalytics((analytics) => {
+        const previous = analytics.feedback[artifact.id] || {};
+        analytics.feedback[artifact.id] = { ...previous, artifactId: artifact.id, file: artifact.file, value: value ?? previous.value ?? null, outcome: outcome ?? previous.outcome ?? null, note: note ?? previous.note ?? null, updatedAt: new Date().toISOString() };
+        return analytics.feedback[artifact.id];
+      });
+      await recordEvent('feedback', { artifactId: artifact.id, label: [value, outcome].filter(Boolean).join(' · ') || 'Feedback updated', detail: note || '' });
+      return json(res, 200, { ok: true, feedback }, origin);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/insights/settings') {
+      const input = await body(req);
+      const cadences = new Set(['manual', 'weekly', 'monthly', 'contextual', 'tunable']);
+      const settings = await updateAnalytics((analytics) => {
+        analytics.settings = {
+          ...analytics.settings,
+          cadence: cadences.has(input.cadence) ? input.cadence : analytics.settings.cadence,
+          manual: typeof input.manual === 'boolean' ? input.manual : analytics.settings.manual,
+          weekly: typeof input.weekly === 'boolean' ? input.weekly : analytics.settings.weekly,
+          monthly: typeof input.monthly === 'boolean' ? input.monthly : analytics.settings.monthly,
+          contextual: typeof input.contextual === 'boolean' ? input.contextual : analytics.settings.contextual,
+          foregroundTime: false,
+        };
+        return analytics.settings;
+      });
+      return json(res, 200, { ok: true, settings }, origin);
+    }
+    if (req.method === 'POST' && url.pathname === '/api/recommendations/action') {
+      const input = await body(req);
+      const recommendationId = cleanEventValue(input.id, 120);
+      const actions = new Set(['done', 'dismissed', 'snoozed', 'reset']);
+      if (!recommendationId || !actions.has(input.action)) throw new Error('Choose a valid recommendation action.');
+      await updateAnalytics((analytics) => {
+        if (input.action === 'reset') delete analytics.recommendationState[recommendationId];
+        else analytics.recommendationState[recommendationId] = { status: input.action, at: new Date().toISOString(), until: input.action === 'snoozed' ? new Date(Date.now() + 7 * 86_400_000).toISOString() : null };
+      });
+      await recordEvent('recommendation', { label: input.action, detail: recommendationId });
+      return json(res, 200, { ok: true }, origin);
     }
     if (req.method === 'POST' && url.pathname === '/api/projects/choose') {
       const chosen = await chooseFolder('Choose a project to watch for Lavishes');
@@ -489,6 +861,7 @@ const server = createServer(async (req, res) => {
       if (!config.archiveRoot) throw new Error('Choose an archive folder first.');
       const artifact = await artifactForFile(input.file);
       const manifest = await snapshotArtifact(config, artifact, 'manual');
+      await recordEvent('snapshot', { artifactId: artifact.id, label: 'Manual version protected' });
       return json(res, 201, { ok: true, versionCount: manifest?.versions.length || 0 }, origin);
     }
     if (req.method === 'POST' && url.pathname === '/api/artifacts/open') {
@@ -497,23 +870,27 @@ const server = createServer(async (req, res) => {
       const args = [artifact.file];
       if (input.reopen) args.push('--reopen');
       spawn(LAVISH_BIN, args, { detached: true, stdio: 'ignore' }).unref();
+      await recordEvent('open', { artifactId: artifact.id, query: input.query, label: input.reopen ? 'Lavish reopened' : 'Lavish opened' });
       return json(res, 202, { ok: true }, origin);
     }
     if (req.method === 'POST' && url.pathname === '/api/artifacts/reveal') {
       const input = await body(req);
       const artifact = await artifactForFile(input.file);
       spawn('/usr/bin/open', ['-R', artifact.file], { detached: true, stdio: 'ignore' }).unref();
+      await recordEvent('reveal', { artifactId: artifact.id, label: 'Revealed in Finder' });
       return json(res, 202, { ok: true }, origin);
     }
     if (req.method === 'POST' && url.pathname === '/api/versions/open') {
       const input = await body(req);
       const resolved = await resolveVersion(input.file, input.versionId);
       spawn('/usr/bin/open', [resolved.archivedFile], { detached: true, stdio: 'ignore' }).unref();
+      await recordEvent('version_open', { artifactId: resolved.artifact.id, label: 'Archived version opened', detail: resolved.version.createdAt });
       return json(res, 202, { ok: true }, origin);
     }
     if (req.method === 'POST' && url.pathname === '/api/versions/restore') {
       const input = await body(req);
       const restored = await restoreVersion(input.file, input.versionId);
+      await recordEvent('restore', { artifactId: restored.artifact.id, label: 'Archived version restored', detail: restored.version.createdAt });
       return json(res, 200, { ok: true, restoredAt: new Date().toISOString(), versionId: restored.version.id }, origin);
     }
     return json(res, 404, { error: 'Not found.' }, origin);
