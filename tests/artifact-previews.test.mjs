@@ -18,7 +18,7 @@ async function eventually(read, predicate, timeout = 30_000) {
 }
 
 // The hosted Linux runner is slower at serial Chrome launches than developer machines.
-const previewTimeout = process.env.CI === 'true' ? 60_000 : 30_000;
+const previewTimeout = process.env.CI === 'true' ? 120_000 : 30_000;
 
 async function fixture(run, { browser } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'lavish-previews-'));

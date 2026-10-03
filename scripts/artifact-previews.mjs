@@ -12,6 +12,7 @@ export async function browserExecutable() {
 
 const CONTENT_TYPES = { '.html': 'text/html', '.htm': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.mjs': 'text/javascript', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif', '.woff': 'font/woff', '.woff2': 'font/woff2' };
 const CSP = "default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' data:; connect-src 'none'; frame-src 'none'; worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; sandbox allow-scripts allow-same-origin";
+const hostedLinux = process.platform === 'linux' && process.env.CI === 'true';
 const debugPreview = (stage) => {
   if (process.env.LAVISH_PREVIEW_DEBUG === '1') console.error(`[DEBUG-lavish-preview pid=${process.pid}] ${stage}`);
 };
@@ -23,7 +24,8 @@ export async function capturePreview(artifact, bundle) {
   debugPreview('launch:start');
   const browser = await puppeteer.launch({
     executablePath: await browserExecutable(), headless: true,
-    timeout: 10_000, protocolTimeout: 10_000,
+    timeout: hostedLinux ? 30_000 : 10_000,
+    protocolTimeout: hostedLinux ? 30_000 : 10_000,
     // The companion owns its signal lifecycle. Puppeteer's default SIGTERM
     // handler would close Chrome but leave the HTTP service running.
     handleSIGTERM: false, handleSIGINT: false, handleSIGHUP: false,
@@ -32,11 +34,11 @@ export async function capturePreview(artifact, bundle) {
       '--host-resolver-rules=MAP * ~NOTFOUND', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
       // GitHub's Linux runners restrict unprivileged user namespaces. CI captures
       // only locally intercepted fixture bytes, so Chrome can run without its sandbox there.
-      ...(process.platform === 'linux' && process.env.CI === 'true' ? ['--no-sandbox'] : []),
+      ...(hostedLinux ? ['--no-sandbox'] : []),
     ],
   });
   debugPreview(`launch:ready chromePid=${browser.process()?.pid}`);
-  const deadline = setTimeout(() => { browser.process()?.kill('SIGKILL'); }, 15_000);
+  const deadline = setTimeout(() => { browser.process()?.kill('SIGKILL'); }, hostedLinux ? 60_000 : 15_000);
   try {
     const page = await browser.newPage();
     debugPreview('page:ready');
@@ -59,7 +61,7 @@ export async function capturePreview(artifact, bundle) {
     page.on('dialog', (dialog) => { void dialog.dismiss().catch(() => {}); });
     browser.on('targetcreated', (target) => { if (target.type() === 'page') void target.page().then((popup) => popup?.close()).catch(() => {}); });
     debugPreview('navigate:start');
-    await page.goto(entry, { waitUntil: 'networkidle0', timeout: 8_000 });
+    await page.goto(entry, { waitUntil: 'networkidle0', timeout: hostedLinux ? 30_000 : 8_000 });
     debugPreview('navigate:ready');
     await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
     debugPreview('screenshot:start');
