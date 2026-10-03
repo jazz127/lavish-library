@@ -30,8 +30,6 @@ jobs:
         run: npm ci
 
       - name: Test
-        env:
-          LAVISH_PREVIEW_DEBUG: '1'
         run: npm test
 
       - name: Lint
