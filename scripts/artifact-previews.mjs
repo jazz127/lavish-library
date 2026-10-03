@@ -23,7 +23,13 @@ export async function capturePreview(artifact, bundle) {
     // The companion owns its signal lifecycle. Puppeteer's default SIGTERM
     // handler would close Chrome but leave the HTTP service running.
     handleSIGTERM: false, handleSIGINT: false, handleSIGHUP: false,
-    args: ['--disable-background-networking', '--disable-component-update', '--no-first-run', '--host-resolver-rules=MAP * ~NOTFOUND', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'],
+    args: [
+      '--disable-background-networking', '--disable-component-update', '--no-first-run',
+      '--host-resolver-rules=MAP * ~NOTFOUND', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+      // GitHub's Linux runners restrict unprivileged user namespaces. CI captures
+      // only locally intercepted fixture bytes, so Chrome can run without its sandbox there.
+      ...(process.platform === 'linux' && process.env.CI === 'true' ? ['--no-sandbox'] : []),
+    ],
   });
   const deadline = setTimeout(() => { browser.process()?.kill('SIGKILL'); }, 15_000);
   try {
