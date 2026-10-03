@@ -28,9 +28,9 @@ export async function capturePreview(artifact, bundle) {
     args: [
       '--disable-background-networking', '--disable-component-update', '--no-first-run',
       '--host-resolver-rules=MAP * ~NOTFOUND', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
-      // GitHub's Linux runners restrict unprivileged user namespaces. CI captures
-      // only locally intercepted fixture bytes, so Chrome can run without its sandbox there.
-      ...(hostedLinux ? ['--no-sandbox'] : []),
+      // Hosted Linux restricts user namespaces and exposes little /dev/shm. CI captures
+      // only locally intercepted fixture bytes, so use Chrome's CI-safe options there.
+      ...(hostedLinux ? ['--no-sandbox', '--disable-dev-shm-usage'] : []),
     ],
   });
   const deadline = setTimeout(() => { browser.process()?.kill('SIGKILL'); }, hostedLinux ? 60_000 : 15_000);
