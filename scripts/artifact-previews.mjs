@@ -100,6 +100,7 @@ export function createPreviewCache({ directory, collect, capture = capturePrevie
         await rename(`${metadataPath}.tmp`, metadataPath);
         Object.assign(state, { png, status: 'ready', failedAt: null });
       } catch (error) {
+        if (process.env.LAVISH_PREVIEW_DEBUG === '1') console.error('[DEBUG-lavish-ci-preview]', error);
         Object.assign(state, { png: null, status: error.code === 'ENOENT' ? 'missing' : 'failed', failedAt: Date.now() });
         await Promise.all(['png', 'json'].map((extension) => rm(path.join(directory, `${artifact.id}.${extension}`), { force: true }).catch(() => {})));
       } finally { state.pending = false; }
