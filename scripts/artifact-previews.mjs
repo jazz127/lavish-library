@@ -12,11 +12,15 @@ export async function browserExecutable() {
 
 const CONTENT_TYPES = { '.html': 'text/html', '.htm': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.mjs': 'text/javascript', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif', '.woff': 'font/woff', '.woff2': 'font/woff2' };
 const CSP = "default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' data:; connect-src 'none'; frame-src 'none'; worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; sandbox allow-scripts allow-same-origin";
+const debugPreview = (stage) => {
+  if (process.env.LAVISH_PREVIEW_DEBUG === '1') console.error(`[DEBUG-lavish-preview pid=${process.pid}] ${stage}`);
+};
 
 // Render the exact collected bytes. No HTTP request is ever continued to a
 // network server, and no file:// URL or filesystem path reaches the browser.
 export async function capturePreview(artifact, bundle) {
   const { default: puppeteer } = await import('puppeteer-core');
+  debugPreview('launch:start');
   const browser = await puppeteer.launch({
     executablePath: await browserExecutable(), headless: true,
     timeout: 10_000, protocolTimeout: 10_000,
@@ -31,9 +35,11 @@ export async function capturePreview(artifact, bundle) {
       ...(process.platform === 'linux' && process.env.CI === 'true' ? ['--no-sandbox'] : []),
     ],
   });
+  debugPreview(`launch:ready chromePid=${browser.process()?.pid}`);
   const deadline = setTimeout(() => { browser.process()?.kill('SIGKILL'); }, 15_000);
   try {
     const page = await browser.newPage();
+    debugPreview('page:ready');
     await page.setViewport({ width: 1200, height: 750, deviceScaleFactor: 1 });
     await page.setBypassServiceWorker(true);
     await page.setRequestInterception(true);
@@ -52,12 +58,19 @@ export async function capturePreview(artifact, bundle) {
     });
     page.on('dialog', (dialog) => { void dialog.dismiss().catch(() => {}); });
     browser.on('targetcreated', (target) => { if (target.type() === 'page') void target.page().then((popup) => popup?.close()).catch(() => {}); });
+    debugPreview('navigate:start');
     await page.goto(entry, { waitUntil: 'networkidle0', timeout: 8_000 });
+    debugPreview('navigate:ready');
     await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
-    return Buffer.from(await page.screenshot({ type: 'png' }));
+    debugPreview('screenshot:start');
+    const screenshot = Buffer.from(await page.screenshot({ type: 'png' }));
+    debugPreview('screenshot:ready');
+    return screenshot;
   } finally {
     clearTimeout(deadline);
+    debugPreview('browser-close:start');
     await browser.close().catch(() => { browser.process()?.kill('SIGKILL'); });
+    debugPreview('browser-close:ready');
   }
 }
 
@@ -100,6 +113,7 @@ export function createPreviewCache({ directory, collect, capture = capturePrevie
         await rename(`${metadataPath}.tmp`, metadataPath);
         Object.assign(state, { png, status: 'ready', failedAt: null });
       } catch (error) {
+        if (process.env.LAVISH_PREVIEW_DEBUG === '1') console.error('[DEBUG-lavish-preview capture:error]', error);
         Object.assign(state, { png: null, status: error.code === 'ENOENT' ? 'missing' : 'failed', failedAt: Date.now() });
         await Promise.all(['png', 'json'].map((extension) => rm(path.join(directory, `${artifact.id}.${extension}`), { force: true }).catch(() => {})));
       } finally { state.pending = false; }
