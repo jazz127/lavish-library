@@ -55,7 +55,6 @@ async function fixture(run, { browser } = {}) {
     await run({ api, library, preview, red, blue, sourceDir, configDir, service, exited });
   } catch (error) { error.message += `\nService stderr: ${stderr}`; throw error; }
   finally {
-    if (process.env.LAVISH_PREVIEW_DEBUG === '1' && stderr) console.error(`[DEBUG-lavish-preview service pid=${service.pid}]\n${stderr}`);
     service.kill('SIGTERM');
     const cleanup = setTimeout(() => service.kill('SIGKILL'), 2000);
     await exited;
