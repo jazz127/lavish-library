@@ -745,14 +745,14 @@ async function artifactForFile(file) {
 
 // Read declarations from the saved bytes, including archives made before
 // this feature. Never attribute today's declarations to an older snapshot.
-async function archivedRevisionContext(directory, version) {
+async function archivedRevisionContext(directory, version, cachedContexts) {
   try {
     const archivedFile = path.resolve(directory, version.file);
     if (!insideFolder(directory, archivedFile) || await localPathStatus(directory, archivedFile) !== 'file') return [];
     await access(archivedFile, constants.R_OK);
     if (Array.isArray(version.revisionContext)) return version.revisionContext;
     const key = await fileCacheKey(archivedFile);
-    const cached = legacyRevisionContexts.get(archivedFile);
+    const cached = cachedContexts.get(archivedFile);
     if (cached?.key === key) return cached.context;
     const context = revisionContext(await readFile(archivedFile, 'utf8'));
     legacyRevisionContexts.delete(archivedFile);
@@ -782,11 +782,12 @@ async function versionsFor(file) {
     if (archivedSha === currentSha) currentVersionIndex = index;
   }
   const directory = artifactArchiveDir(config, artifact);
+  const cachedContexts = new Map(legacyRevisionContexts);
   const versions = [];
   // Bound cold reads of legacy copies; new entries only read manifest metadata.
   for (let start = 0; start < manifest.versions.length; start += 4) {
     const batch = manifest.versions.slice(start, start + 4);
-    const contexts = await Promise.all(batch.map((version) => archivedRevisionContext(directory, version)));
+    const contexts = await Promise.all(batch.map((version) => archivedRevisionContext(directory, version, cachedContexts)));
     for (const [offset, version] of batch.entries()) {
       const index = start + offset;
       const previous = manifest.versions[index - 1];

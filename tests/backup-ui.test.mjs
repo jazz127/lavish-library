@@ -30,7 +30,7 @@ test('synthetic browser covers backup states, accessible warnings, retry and sum
     await command(['screenshot', path.join(directory, `${name}.png`)]);
     await writeFile(path.join(directory, `${name}.txt`), await browser('console.log(await page.snapshot());'));
   };
-  await backupFixture(async ({ api, configure, library, blockFirst, unblockFirst, blockNext, unblockNext }) => {
+  await backupFixture(async ({ api, file, configure, library, blockFirst, unblockFirst, blockNext, unblockNext }) => {
     const bundle = await build({
       stdin: { contents: "import React from 'react'; import { createRoot } from 'react-dom/client'; import Home from './app/page.tsx'; import './app/globals.css'; createRoot(document.getElementById('root')).render(<Home />);", resolveDir: process.cwd(), loader: 'tsx' },
       bundle: true, write: false, outfile: 'app.js', jsx: 'automatic', conditions: ['style'],
@@ -71,22 +71,56 @@ test('synthetic browser covers backup states, accessible warnings, retry and sum
         assert((await page.eval(() => document.querySelector('.archive-stats').textContent)).includes('1 latest protected'), 'recovery summary missing');
         assert(await page.eval(() => !!document.querySelector('.backup-status time[datetime]')), 'last success date missing');`);
       const saved = (await library()).artifacts[0].lastBackedUpAt;
+      await check(`await page.click('.history-chip'); await page.wait('.version-row.current');
+        assert((await page.eval(() => document.querySelector('.history-summary strong').textContent)) === '1', 'initial version count incorrect');
+        assert((await page.eval(() => document.querySelector('.version-row.current .version-title strong').textContent)) === 'Current protected version', 'initial current label missing');
+        assert(await page.eval(() => document.querySelector('.version-row.current .version-actions button:last-child').disabled), 'current restore should be disabled');
+        await page.eval(() => {
+          window.historyDrawer = document.querySelector('.history-drawer');
+          window.historyTimeline = document.querySelector('.timeline');
+          window.historyWasHidden = false;
+          window.historyObserver = new MutationObserver(() => {
+            if (!window.historyTimeline.isConnected || window.historyDrawer.querySelector('.history-loading')) window.historyWasHidden = true;
+          });
+          window.historyObserver.observe(window.historyDrawer, { childList: true, subtree: true });
+        });`);
       await blockNext();
       await check(`await page.wait('.backup-status.failed');
         assert((await page.eval(() => document.querySelector('.archive-stats').textContent)).includes('1 failed'), 'automatic failure summary missing');
         assert((await page.eval(() => document.querySelector('[role="alert"]').textContent)).includes('Latest content is not protected'), 'old copy implied latest protection');
         assert((await page.eval(() => document.querySelector('.backup-status time').getAttribute('datetime'))) === ${JSON.stringify(saved)}, 'last success was lost');
         assert(await page.eval(() => !document.querySelector('.history-chip.protected')), 'history chip falsely indicates protection');`);
+      await check(`await page.wait('.history-drawer .backup-status.failed');
+        await page.wait('.version-row:not(.current) .version-actions button:last-child:not(:disabled)');
+        assert(await page.eval(() => !document.querySelector('.version-row.current')), 'failed backup left a current version');
+        assert(await page.eval(() => !document.querySelector('.version-title strong').textContent.includes('Current protected')), 'failed backup left a protected label');
+        assert((await page.eval(() => document.querySelector('.history-summary strong').textContent)) === '1', 'failed backup changed saved count');
+        assert(await page.eval(() => window.historyDrawer === document.querySelector('.history-drawer') && !window.historyWasHidden), 'background refresh replaced or hid the drawer');`);
       await capture('failed-grid');
       await command(['resize', '390', '844']);
       await check(`await page.click('[aria-label="List view"]');
         assert(await page.eval(() => !!document.querySelector('.artifact-list [role="alert"]')), 'list warning missing');`);
       await capture('failed-mobile-list');
       await unblockNext();
-      await check(`await page.click('.backup-retry'); await page.wait('.backup-status.protected');
-        assert(await page.eval(() => !document.querySelector('[role="alert"]')), 'second recovery warning stale');`);
+      await check(`await page.wait('.history-drawer .backup-status.protected');
+        await page.wait('.version-row:nth-child(2)');
+        assert((await page.eval(() => document.querySelector('.history-summary strong').textContent)) === '2', 'autosave version count stale');
+        assert((await page.eval(() => document.querySelector('.version-row:first-child .version-title strong').textContent)) === 'Current protected version', 'autosave current label stale');
+        assert(await page.eval(() => document.querySelector('.version-row:first-child .version-actions button:last-child').disabled), 'autosaved version is restorable');
+        assert(await page.eval(() => !document.querySelector('.version-row:nth-child(2) .version-actions button:last-child').disabled), 'older version is not restorable');
+        assert(await page.eval(() => !document.querySelector('[role="alert"]')), 'automatic recovery warning stale');`);
+      await writeFile(file, '<title>Synthetic backup plan</title><h1>Third autosaved revision</h1>');
+      await check(`await page.wait('.version-row:nth-child(3)');
+        assert((await page.eval(() => document.querySelector('.history-summary strong').textContent)) === '3', 'later autosave version count stale');
+        assert(await page.eval(() => document.querySelectorAll('.version-row.current').length === 1 && document.querySelector('.version-row:first-child').classList.contains('current')), 'later autosave current version stale');
+        assert(await page.eval(() => [...document.querySelectorAll('.version-row:not(.current) .version-actions button:last-child')].every((button) => !button.disabled)), 'older restore eligibility stale');
+        assert(await page.eval(() => window.historyDrawer === document.querySelector('.history-drawer') && !window.historyWasHidden), 'autosaves replaced or hid the drawer');
+        await page.eval(() => window.historyObserver.disconnect());`);
       await configure(false);
-      await check(`${refresh} assert((await page.eval(() => document.querySelector('.backup-status').textContent)).includes('Archive disabled'), 'disable did not clear protection');`);
+      await check(`${refresh} assert((await page.eval(() => document.querySelector('.backup-status').textContent)).includes('Archive disabled'), 'disable did not clear protection');
+        await page.wait('.history-empty');
+        assert(await page.eval(() => !document.querySelector('.version-row')), 'manual refresh left the paused archive timeline');
+        await page.click('[aria-label="Close version history"]');`);
       // A synthetic API response is used only for the never-backed-up state,
       // because /library normally attempts the initial snapshot during a scan.
       await configure(true);

@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -749,5 +750,47 @@ test('legacy history caches revision declarations including absent registries', 
     await writeFile(path.join(first.archivePath, first.versions[0].file), '<script data-lavish-revisions>[{"id":"changed"}]</script>');
     assert.equal((await history()).versions[0].revisionContext[0].id, 'changed');
     assert.equal((await archiveReads()).length - before, 2);
+  }, { trackArchiveReads: true });
+});
+
+test('legacy history larger than the cache preserves hits across repeated opens', async () => {
+  await fixture(async ({ post, history, archiveReads, html }) => {
+    await post('/artifacts/snapshot');
+    const first = await history();
+    const manifestFile = path.join(first.archivePath, 'manifest.json');
+    const manifest = JSON.parse(await readFile(manifestFile, 'utf8'));
+    const baseline = manifest.versions[0];
+    const baselineDirectory = path.join(first.archivePath, path.dirname(baseline.file));
+    manifest.versions = [];
+    for (let index = 0; index < 260; index += 1) {
+      const id = `legacy-${index}`;
+      const version = structuredClone(baseline);
+      version.id = id;
+      version.file = `versions/${id}/plan.html`;
+      delete version.revisionContext;
+      const context = index % 2 === 0 ? [{ id }] : [];
+      const bytes = html + (context.length ? `<script data-lavish-revisions>${JSON.stringify(context)}</script>` : '');
+      await cp(baselineDirectory, path.join(first.archivePath, 'versions', id), { recursive: true });
+      await writeFile(path.join(first.archivePath, version.file), bytes);
+      version.sha256 = createHash('sha256').update(bytes).digest('hex');
+      version.bundle.find((entry) => entry.path === 'plan.html').sha256 = version.sha256;
+      version.bundleSha256 = createHash('sha256').update(JSON.stringify(version.bundle)).digest('hex');
+      version.size = Buffer.byteLength(bytes);
+      manifest.versions.push(version);
+    }
+    await writeFile(manifestFile, JSON.stringify(manifest));
+    let reads = (await archiveReads()).length;
+    for (let open = 0; open < 4; open += 1) {
+      const result = await history();
+      assert.equal(result.versions.length, 260);
+      for (const version of result.versions) {
+        const index = Number(version.id.slice('legacy-'.length));
+        assert.deepEqual(version.revisionContext.map((entry) => entry.id), index % 2 === 0 ? [version.id] : []);
+      }
+      const nextReads = (await archiveReads()).length;
+      if (open === 0) assert.equal(nextReads - reads, 260);
+      else assert.ok(nextReads - reads <= 4, `Reopening reread ${nextReads - reads} archived HTML files`);
+      reads = nextReads;
+    }
   }, { trackArchiveReads: true });
 });
