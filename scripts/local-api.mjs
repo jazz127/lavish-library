@@ -538,6 +538,7 @@ function refreshArtifactWatchers(config, artifact, watchDirs) {
     entry = { watchers: new Map(), timer: null, archiveRoot: config.archiveRoot };
     artifactWatchers.set(artifact.file, entry);
   }
+  entry.refreshToken = {};
   for (const [directory, watcher] of entry.watchers) {
     if (!watchDirs.has(directory)) {
       watcher.close();
@@ -568,11 +569,12 @@ function refreshArtifactWatchers(config, artifact, watchDirs) {
   }
 }
 
-async function syncArtifactWatchers(config, artifacts) {
+async function syncArtifactWatchers(config, artifacts, watcherOwners) {
   if ((await readConfig()).archiveRoot !== config.archiveRoot) return;
   if (!config.archiveRoot) return closeArtifactWatchers();
   const targets = new Set(artifacts.filter((artifact) => artifact.exists).map((artifact) => artifact.file));
   for (const [file, entry] of artifactWatchers) {
+    if (watcherOwners.get(file) !== entry.refreshToken) continue;
     if (!targets.has(file) || entry.archiveRoot !== config.archiveRoot) {
       closeWatcherEntry(entry);
       artifactWatchers.delete(file);
@@ -581,6 +583,7 @@ async function syncArtifactWatchers(config, artifacts) {
 }
 
 async function buildLibrary() {
+  const watcherOwners = new Map([...artifactWatchers].map(([file, entry]) => [file, entry.refreshToken]));
   const [knownArtifacts, config, running, logPath] = await Promise.all([
     scanKnownArtifacts({ force: true }),
     readConfig(),
@@ -649,7 +652,7 @@ async function buildLibrary() {
       if (latestProtected && artifact.versionCount > 0) protectedArtifacts += 1;
     }
   }
-  await syncArtifactWatchers(config, artifacts);
+  await syncArtifactWatchers(config, artifacts, watcherOwners);
   for (const artifact of artifacts) if (artifact.exists) previews.schedule(artifact);
 
   const projects = [...projectMap.values(), ...(hasLoose ? [looseProject] : [])].map((project) => ({

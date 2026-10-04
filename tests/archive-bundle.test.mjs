@@ -277,6 +277,45 @@ test('superseded scan cleanup leaves the active archive watchers intact', { time
   }, { pauseReadFile: 'plan.html' });
 });
 
+for (const keepExisting of [false, true]) {
+  test(`a stale same-archive scan preserves ${keepExisting ? 'refreshed' : 'newly installed'} restore watchers`, { timeout: 15_000 }, async () => {
+    await fixture(async ({ directory, sourceDir, file, html, get, post, publicationPaused, resumePublication }) => {
+      const secondDir = path.join(sourceDir, 'recovery');
+      const secondFile = path.join(secondDir, 'second.html');
+      const secondHtml = '<title>Recovered artifact</title><img src="nested/icon.png">';
+      const icon = path.join(secondDir, 'nested/icon.png');
+      await mkdir(path.dirname(icon), { recursive: true });
+      await writeFile(secondFile, secondHtml);
+      await writeFile(icon, 'recovery-baseline');
+      await writeFile(path.join(directory, 'state/state.json'), JSON.stringify({ sessions: { demo: { file }, second: { file: secondFile } } }));
+      await post('/artifacts/snapshot');
+      await post('/artifacts/snapshot', { file: secondFile });
+      const secondHistory = () => get(`/artifacts/versions?file=${encodeURIComponent(secondFile)}`);
+      const baseline = (await secondHistory()).versions[0];
+      await rm(secondFile);
+      if (!keepExisting) await get('/library');
+      await writeFile(file, `${html}<p>Changed before scanning</p>`);
+      const scanning = get('/library');
+      assert.equal((await publicationPaused)[0], 'manifest-published');
+      const restored = await post('/versions/restore', { file: secondFile, versionId: baseline.id });
+      assert.equal(restored.sourceRecreated, true);
+      resumePublication();
+      const stale = await scanning;
+      assert.equal(stale.artifacts.find((artifact) => artifact.file === secondFile).exists, false);
+      await writeFile(icon, 'edited-after-restoring');
+      const assetChange = await waitForVersion(secondHistory, 2);
+      assert.equal(assetChange.versions[0].reason, 'change');
+      assert.equal(await readFile(path.join(assetChange.archivePath, path.dirname(assetChange.versions[0].file), 'nested/icon.png'), 'utf8'), 'edited-after-restoring');
+      const updatedHtml = `${secondHtml}<p>Changed after restoring</p>`;
+      await writeFile(`${secondFile}.tmp`, updatedHtml);
+      await rename(`${secondFile}.tmp`, secondFile);
+      const htmlChange = await waitForVersion(secondHistory, 3);
+      assert.equal(htmlChange.versions[0].reason, 'change');
+      assert.equal(await readFile(path.join(htmlChange.archivePath, htmlChange.versions[0].file), 'utf8'), updatedHtml);
+    }, { pauseAfterVersion: 2 });
+  });
+}
+
 test('directory watchers archive nested assets and survive atomic replacement', async () => {
   await fixture(async ({ sourceDir, get, history, publicationPaused, resumePublication }) => {
     await get('/library');
