@@ -30,7 +30,7 @@ test('synthetic browser covers backup states, accessible warnings, retry and sum
     await command(['screenshot', path.join(directory, `${name}.png`)]);
     await writeFile(path.join(directory, `${name}.txt`), await browser('console.log(await page.snapshot());'));
   };
-  await backupFixture(async ({ api, file, configure, library, blockFirst, unblockFirst, blockNext, unblockNext }) => {
+  await backupFixture(async ({ api, file, configure, library, blockFirst, unblockFirst, blockNext, unblockNext, setUnreadableFiles }) => {
     const bundle = await build({
       stdin: { contents: "import React from 'react'; import { createRoot } from 'react-dom/client'; import Home from './app/page.tsx'; import './app/globals.css'; createRoot(document.getElementById('root')).render(<Home />);", resolveDir: process.cwd(), loader: 'tsx' },
       bundle: true, write: false, outfile: 'app.js', jsx: 'automatic', conditions: ['style'],
@@ -116,6 +116,38 @@ test('synthetic browser covers backup states, accessible warnings, retry and sum
         assert(await page.eval(() => [...document.querySelectorAll('.version-row:not(.current) .version-actions button:last-child')].every((button) => !button.disabled)), 'older restore eligibility stale');
         assert(await page.eval(() => window.historyDrawer === document.querySelector('.history-drawer') && !window.historyWasHidden), 'autosaves replaced or hid the drawer');
         await page.eval(() => window.historyObserver.disconnect());`);
+      for (const failure of ['html', 'asset']) {
+        const assetFile = path.join(path.dirname(file), 'protected-asset.png');
+        await writeFile(assetFile, `Saved asset for ${failure}`);
+        const content = `<title>Synthetic backup plan</title><img src="protected-asset.png"><h1>Protected before ${failure} read failure</h1>`;
+        await writeFile(file, content);
+        const protectedArtifact = (await library()).artifacts[0];
+        const count = protectedArtifact.versionCount;
+        await check(`await page.wait('.version-row:nth-child(${count})');
+          assert(await page.eval(() => document.querySelector('.version-row:first-child').classList.contains('current')), 'readable bundle did not match');
+          await page.eval(() => { window.readFailureDrawer = document.querySelector('.history-drawer'); window.readFailureTimeline = document.querySelector('.timeline'); });`);
+        await setUnreadableFiles([failure === 'html' ? file : assetFile]);
+        await writeFile(file, `${content}<p>Pending edit during read failure</p>`);
+        await check(`await page.wait('.history-drawer .backup-status.failed');
+          await page.wait('.version-row:not(.current) .version-actions button:last-child:not(:disabled)');
+          assert(await page.eval(() => !document.querySelector('.version-row.current')), '${failure} read failure left a current version');
+          assert(await page.eval(() => [...document.querySelectorAll('.version-title strong')].every((label) => !label.textContent.includes('Current protected'))), '${failure} read failure left a protected label');
+          assert(await page.eval(() => [...document.querySelectorAll('.version-actions button:last-child')].every((button) => !button.disabled)), '${failure} read failure disabled restore');
+          assert((await page.eval(() => document.querySelector('.history-summary strong').textContent)) === ${JSON.stringify(String(count))}, '${failure} read failure dropped saved copies');
+          assert((await page.eval(() => document.querySelector('.history-drawer [role="alert"]').textContent)).includes('EACCES'), '${failure} read failure warning missing');
+          assert((await page.eval(() => document.querySelector('.history-drawer time').getAttribute('datetime'))) === ${JSON.stringify(protectedArtifact.lastBackedUpAt)}, '${failure} read failure lost last success');
+          assert(await page.eval(() => window.readFailureDrawer === document.querySelector('.history-drawer') && window.readFailureTimeline === document.querySelector('.timeline') && !document.querySelector('.history-loading')), '${failure} read failure hid the drawer');
+          await page.click('[aria-label="Close version history"]');
+          await page.click('.history-chip');
+          await page.wait('.version-row:not(.current) .version-actions button:last-child:not(:disabled)');
+          assert((await page.eval(() => document.querySelector('.history-summary strong').textContent)) === ${JSON.stringify(String(count))}, 'initial ${failure} failure dropped saved copies');
+          assert(await page.eval(() => !document.querySelector('.history-empty') && !document.querySelector('.version-row.current')), 'initial ${failure} failure showed an unconfigured archive or current copy');`);
+        await setUnreadableFiles([]);
+        await check(`await page.wait('.version-row:nth-child(${count + 1})');
+          await page.wait('.history-drawer .backup-status.protected');
+          assert(await page.eval(() => document.querySelectorAll('.version-row.current').length === 1 && document.querySelector('.version-row:first-child').classList.contains('current')), 'readable ${failure} recovery did not match');
+          assert(await page.eval(() => document.querySelector('.version-row.current .version-actions button:last-child').disabled), 'readable ${failure} recovery left restore enabled');`);
+      }
       await configure(false);
       await check(`${refresh} assert((await page.eval(() => document.querySelector('.backup-status').textContent)).includes('Archive disabled'), 'disable did not clear protection');
         await page.wait('.history-empty');
@@ -136,5 +168,5 @@ test('synthetic browser covers backup states, accessible warnings, retry and sum
       const child = spawn('chrome-devtools-axi', ['stop'], { env: { ...process.env, CHROME_DEVTOOLS_AXI_SESSION: session }, stdio: 'ignore' });
       await new Promise((resolve) => child.once('exit', resolve));
     }
-  }, { uiPort });
+  }, { uiPort, readFailures: true });
 });

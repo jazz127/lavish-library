@@ -7,8 +7,9 @@ import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { createReadFailure } from './helpers/read-failure.mjs';
 
-async function fixture(run, { pauseAfterVersion, pauseArchiveName = 'archive', pauseReason, pauseReadFile, pauseReadArchiveName = 'archive', pauseBeforePublication = false, pauseRestoreWrite = false, trackArchiveReads = false } = {}) {
+async function fixture(run, { pauseAfterVersion, pauseArchiveName = 'archive', pauseReason, pauseReadFile, pauseReadArchiveName = 'archive', pauseBeforePublication = false, pauseRestoreWrite = false, trackArchiveReads = false, readFailures = false } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'lavish-bundle-'));
   const sourceDir = path.join(directory, 'project', '.lavish');
   const stateDir = path.join(directory, 'state');
@@ -30,6 +31,8 @@ async function fixture(run, { pauseAfterVersion, pauseArchiveName = 'archive', p
   const port = socket.address().port;
   await new Promise((resolve) => socket.close(resolve));
   const serviceArgs = [];
+  const readFailure = readFailures ? await createReadFailure(directory) : null;
+  if (readFailure) serviceArgs.push('--import', readFailure.preload);
   const pauseEnabled = Boolean(pauseAfterVersion || pauseReadFile || pauseBeforePublication || pauseRestoreWrite || trackArchiveReads);
   if (pauseEnabled) {
     // Hold the manifest rename's completion after its bytes become observable.
@@ -101,7 +104,7 @@ async function fixture(run, { pauseAfterVersion, pauseArchiveName = 'archive', p
       try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break; } catch { /* Starting. */ }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    await run({ directory, sourceDir, file, html, api, get, post, history, publicationPaused, archiveReads: async () => (await readFile(path.join(directory, 'archive-reads.log'), 'utf8').catch(() => '')).trim().split('\n').filter(Boolean), resumePublication: () => service.send('resume') });
+    await run({ directory, sourceDir, file, html, api, get, post, history, publicationPaused, setUnreadableFiles: readFailure?.setUnreadableFiles, archiveReads: async () => (await readFile(path.join(directory, 'archive-reads.log'), 'utf8').catch(() => '')).trim().split('\n').filter(Boolean), resumePublication: () => service.send('resume') });
   } finally {
     service.kill('SIGTERM');
     await exited;
@@ -116,6 +119,50 @@ async function waitForVersion(history, count) {
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
   assert.fail(`Watcher did not archive ${count} versions`);
+}
+
+for (const unreadablePath of ['plan.html', 'assets/style.css', 'assets/logo.png', 'assets/nested/icon.png']) {
+  test(`saved history survives current bundle read failure for ${unreadablePath}`, async () => {
+    await fixture(async ({ sourceDir, file, html, get, post, history, setUnreadableFiles }) => {
+      await post('/artifacts/snapshot');
+      const original = await history();
+      const baseline = original.versions[0];
+      assert.equal(baseline.isCurrent, true);
+      const unreadableFile = path.join(sourceDir, unreadablePath);
+      await setUnreadableFiles([unreadableFile]);
+      await writeFile(file, `${html}<h1>Unsaved edit</h1>`);
+      const library = await get('/library');
+      assert.match(library.artifacts[0].backupError, /EACCES/);
+      assert.equal(library.archive.failedArtifacts, 1);
+      assert.equal(library.archive.protectedArtifacts, 0);
+      assert.equal(library.artifacts[0].versionCount, 1);
+      for (let open = 0; open < 2; open += 1) {
+        const saved = await history();
+        assert.equal(saved.enabled, true);
+        assert.equal(saved.sourceExists, true);
+        assert.equal(saved.versions.length, 1);
+        assert.equal(saved.versions[0].id, baseline.id);
+        assert.equal(saved.versions[0].isCurrent, false);
+      }
+      const archivedFile = path.join(original.archivePath, baseline.file);
+      assert.equal(await readFile(archivedFile, 'utf8'), html);
+      const manifestFile = path.join(original.archivePath, 'manifest.json');
+      const manifest = JSON.parse(await readFile(manifestFile, 'utf8'));
+      delete manifest.versions[0].bundleSha256;
+      manifest.versions[0].supplementalAssets = ['assets/nested/icon.png'];
+      await writeFile(manifestFile, JSON.stringify(manifest));
+      await setUnreadableFiles([unreadableFile, archivedFile]);
+      assert.equal((await history()).versions[0].isCurrent, false);
+      await setUnreadableFiles([]);
+      assert.equal((await history()).versions[0].isCurrent, false);
+      await post('/versions/restore', { file, versionId: baseline.id });
+      assert.equal(await readFile(file, 'utf8'), html);
+      const restored = await history();
+      assert.equal(restored.versions.filter((version) => version.isCurrent).length, 1);
+      assert.equal(restored.versions[0].isCurrent, true);
+      assert.ok(restored.versions.some((version) => version.id === baseline.id));
+    }, { readFailures: true });
+  });
 }
 
 test('reconciliation archives asset-only edits and current compares the complete bundle', async () => {

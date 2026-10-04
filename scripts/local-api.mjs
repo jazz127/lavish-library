@@ -776,8 +776,9 @@ async function versionsFor(file) {
     const supplementalAssets = version.supplementalAssets || [];
     const key = JSON.stringify(supplementalAssets);
     if (!artifact.exists) continue;
-    if (!currentShas.has(key)) currentShas.set(key, (await collectBundle(artifact.file, supplementalAssets)).bundleSha256);
+    if (!currentShas.has(key)) currentShas.set(key, await collectBundle(artifact.file, supplementalAssets).then((bundle) => bundle.bundleSha256).catch(() => null));
     const currentSha = currentShas.get(key);
+    if (currentSha === null) continue;
     const archivedSha = await archivedBundleSha(config, artifact, version).catch(() => null);
     if (archivedSha === currentSha) currentVersionIndex = index;
   }
