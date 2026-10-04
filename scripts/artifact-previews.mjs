@@ -28,8 +28,8 @@ export async function capturePreview(artifact, bundle) {
     args: [
       '--disable-background-networking', '--disable-component-update', '--no-first-run',
       '--host-resolver-rules=MAP * ~NOTFOUND', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
-      // Hosted Linux restricts user namespaces and exposes little /dev/shm. CI captures
-      // only locally intercepted fixture bytes, so use Chrome's CI-safe options there.
+      // Hosted Linux can restrict user namespaces and expose little /dev/shm.
+      // CI options relax Chrome's sandbox; interception and CSP still bound resources.
       ...(hostedLinux ? ['--no-sandbox', '--disable-dev-shm-usage'] : []),
     ],
   });
