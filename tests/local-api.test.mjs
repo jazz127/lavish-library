@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { request as httpRequest } from 'node:http';
 import { mkdtemp, mkdir, readdir, writeFile } from 'node:fs/promises';
 import { after, before, test } from 'node:test';
 import os from 'node:os';
@@ -18,11 +20,11 @@ async function waitForApi() {
   return waitForService(port);
 }
 
-async function waitForService(servicePort) {
+async function waitForService(servicePort, host = '127.0.0.1', requestHost = `${host}:${servicePort}`) {
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
-      const response = await fetch(`http://127.0.0.1:${servicePort}/health`);
-      if (response.ok) return;
+      const response = await requestWithHost(`http://${host}:${servicePort}/health`, { host: requestHost });
+      if (response.status === 200) return;
     } catch { /* Service is still starting. */ }
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
@@ -34,6 +36,18 @@ async function post(route, value) {
   const result = await response.json();
   assert.equal(response.ok, true, result.error);
   return result;
+}
+
+function requestWithHost(url, headers, method = 'GET', body) {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(url, { headers, method }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    request.on('error', reject);
+    request.end(body);
+  });
 }
 
 before(async () => {
@@ -137,6 +151,138 @@ test('rejects hostile browser origins and requires a session token', async () =>
   const ipSession = await fetch(`${api}/session`, { headers: { origin: ipOrigin } });
   assert.equal(ipSession.status, 200);
   assert.equal(ipSession.headers.get('access-control-allow-origin'), ipOrigin);
+});
+
+test('accepts only configured origins and hosts for private-network access', async () => {
+  const remotePort = port + 2;
+  const remoteApi = `http://127.0.0.1:${remotePort}/api`;
+  const remoteOrigin = 'https://library.example.ts.net';
+  const remoteHost = new URL(remoteOrigin).host;
+  const remoteFixture = await mkdtemp(path.join(os.tmpdir(), 'lavish-tracker-remote-test-'));
+  const remoteConfig = path.join(remoteFixture, 'config');
+  const remoteState = path.join(remoteFixture, 'state');
+  await Promise.all([mkdir(remoteConfig, { recursive: true }), mkdir(remoteState, { recursive: true })]);
+  await writeFile(path.join(remoteConfig, 'config.json'), JSON.stringify({ projects: [], archiveRoot: null }));
+  await writeFile(path.join(remoteState, 'state.json'), JSON.stringify({ sessions: {} }));
+
+  const launch = () => spawn(process.execPath, [path.join(root, 'scripts/local-api.mjs')], {
+    cwd: root,
+    env: {
+      ...process.env,
+      LAVISH_TRACKER_API_PORT: String(remotePort),
+      LAVISH_TRACKER_UI_PORT: '3007',
+      LAVISH_TRACKER_BIND_HOST: '0.0.0.0',
+      LAVISH_TRACKER_ALLOWED_ORIGINS: remoteOrigin,
+      LAVISH_TRACKER_CONFIG_DIR: remoteConfig,
+      LAVISH_AXI_STATE_DIR: remoteState,
+      LAVISH_AXI_BIN: '/usr/bin/true',
+    },
+    stdio: 'ignore',
+  });
+  let remoteService = launch();
+
+  try {
+    await waitForService(remotePort, '127.0.0.1', remoteHost);
+    const accepted = await requestWithHost(`${remoteApi}/session`, { origin: remoteOrigin, host: remoteHost });
+    const session = JSON.parse(accepted.body);
+    assert.equal(accepted.status, 200);
+    assert.equal(accepted.headers['access-control-allow-origin'], remoteOrigin);
+    assert.equal(typeof session.token, 'string');
+
+    const unauthorized = await requestWithHost(`${remoteApi}/library`, { origin: remoteOrigin, host: remoteHost });
+    assert.equal(unauthorized.status, 401);
+    const authorized = await requestWithHost(`${remoteApi}/library`, { origin: remoteOrigin, host: remoteHost, 'x-lavish-token': session.token });
+    assert.equal(authorized.status, 200);
+
+    for (const route of ['/library', '/insights', '/artifacts/versions?file=unknown', '/artifacts/preview?id=unknown']) {
+      const originless = await requestWithHost(`${remoteApi}${route}`, { host: remoteHost });
+      assert.equal(originless.status, 401, route);
+    }
+    for (const route of ['/projects', '/events', '/artifacts/feedback', '/insights/settings', '/recommendations/action', '/projects/choose', '/archive/choose', '/archive/disable', '/archive/reveal', '/server/reveal-log', '/artifacts/snapshot', '/artifacts/open', '/artifacts/reveal', '/versions/open', '/versions/restore']) {
+      const originless = await requestWithHost(`${remoteApi}${route}`, { host: remoteHost }, 'POST');
+      assert.equal(originless.status, 401, route);
+    }
+    const originlessSession = await requestWithHost(`${remoteApi}/session`, { host: remoteHost });
+    assert.equal(originlessSession.status, 403);
+    const invalidToken = await requestWithHost(`${remoteApi}/library`, { host: remoteHost, 'x-lavish-token': 'invalid' });
+    assert.equal(invalidToken.status, 401);
+    const originlessAuthorized = await requestWithHost(`${remoteApi}/library`, { host: remoteHost, 'x-lavish-token': session.token });
+    assert.equal(originlessAuthorized.status, 200);
+    const mutation = await requestWithHost(`${remoteApi}/events`,
+      { host: remoteHost, 'x-lavish-token': session.token, 'content-type': 'application/json' },
+      'POST', JSON.stringify({ type: 'search', query: 'remote search', resultCount: 0 }));
+    assert.equal(mutation.status, 201);
+    const insights = await requestWithHost(`${remoteApi}/insights?days=3650`, { host: remoteHost, 'x-lavish-token': session.token });
+    assert.equal(JSON.parse(insights.body).summary.trackedSearches, 1);
+
+    const preflight = await requestWithHost(`${remoteApi}/library`, { host: remoteHost, origin: remoteOrigin, 'access-control-request-method': 'GET', 'access-control-request-headers': 'x-lavish-token' }, 'OPTIONS');
+    assert.equal(preflight.status, 204);
+
+    const rejectedOrigin = await requestWithHost(`${remoteApi}/session`, { origin: 'https://other.example.ts.net', host: remoteHost });
+    assert.equal(rejectedOrigin.status, 403);
+    assert.equal(rejectedOrigin.headers['access-control-allow-origin'], undefined);
+    const rejectedAuthorizedOrigin = await requestWithHost(`${remoteApi}/library`, { origin: 'https://other.example.ts.net', host: remoteHost, 'x-lavish-token': session.token });
+    assert.equal(rejectedAuthorizedOrigin.status, 403);
+
+    const rejectedHost = await requestWithHost(`${remoteApi}/session`, { origin: remoteOrigin, host: 'other.example.ts.net' });
+    assert.equal(rejectedHost.status, 403);
+
+    remoteService.kill('SIGTERM');
+    await once(remoteService, 'exit');
+    remoteService = launch();
+    await waitForService(remotePort, '127.0.0.1', remoteHost);
+    const staleToken = await requestWithHost(`${remoteApi}/library`, { host: remoteHost, 'x-lavish-token': session.token });
+    assert.equal(staleToken.status, 401);
+    const renewed = await requestWithHost(`${remoteApi}/session`, { origin: remoteOrigin, host: remoteHost });
+    const renewedToken = JSON.parse(renewed.body).token;
+    assert.notEqual(renewedToken, session.token);
+    const renewedLibrary = await requestWithHost(`${remoteApi}/library`, { host: remoteHost, 'x-lavish-token': renewedToken });
+    assert.equal(renewedLibrary.status, 200);
+  } finally {
+    remoteService.kill('SIGTERM');
+  }
+});
+
+test('serves IPv6 loopback and exposed sockets with bracketed browser authorities', async () => {
+  for (const bindHost of ['[::1]', '[::]']) {
+    const ipv6Port = port + 3;
+    const origin = 'http://[::1]:3007';
+    const ipv6Api = `http://[::1]:${ipv6Port}/api`;
+    const ipv6Fixture = await mkdtemp(path.join(os.tmpdir(), 'lavish-tracker-ipv6-test-'));
+    const configDir = path.join(ipv6Fixture, 'config');
+    const stateDir = path.join(ipv6Fixture, 'state');
+    await Promise.all([mkdir(configDir), mkdir(stateDir)]);
+    await writeFile(path.join(configDir, 'config.json'), JSON.stringify({ projects: [], archiveRoot: null }));
+    await writeFile(path.join(stateDir, 'state.json'), JSON.stringify({ sessions: {} }));
+    const ipv6Service = spawn(process.execPath, [path.join(root, 'scripts/local-api.mjs')], {
+      cwd: root,
+      env: {
+        ...process.env,
+        LAVISH_TRACKER_BIND_HOST: bindHost,
+        LAVISH_TRACKER_ALLOWED_ORIGINS: bindHost === '[::]' ? origin : '',
+        LAVISH_TRACKER_UI_PORT: '3007',
+        LAVISH_TRACKER_API_PORT: String(ipv6Port),
+        LAVISH_TRACKER_CONFIG_DIR: configDir,
+        LAVISH_AXI_STATE_DIR: stateDir,
+        LAVISH_AXI_BIN: '/usr/bin/true',
+      },
+      stdio: 'ignore',
+    });
+    try {
+      await waitForService(ipv6Port, '[::1]');
+      const sessionResponse = await fetch(`${ipv6Api}/session`, { headers: { origin } });
+      assert.equal(sessionResponse.status, 200);
+      const session = await sessionResponse.json();
+      const library = await fetch(`${ipv6Api}/library`, { headers: { origin, 'x-lavish-token': session.token } });
+      assert.equal(library.status, 200);
+      assert.deepEqual((await library.json()).artifacts, []);
+      const originless = await fetch(`${ipv6Api}/library`);
+      assert.equal(originless.status, bindHost === '[::]' ? 401 : 200);
+    } finally {
+      ipv6Service.kill('SIGTERM');
+      await once(ipv6Service, 'exit');
+    }
+  }
 });
 
 test('ignores archive side effects when resolving one artifact', async () => {

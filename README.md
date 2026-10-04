@@ -32,7 +32,7 @@ The sidebar exposes two complementary destinations directly:
 - **Signal Observatory** shows the evidence: activity, repeat-use signals, topic shelves, searches, recurring Lavish shapes, and the evolving timeline of versions, sessions, restores, feedback, and Git commits.
 - **Lavish Review** turns that evidence into a calm narrative, an actionable recommendation queue, dormant work worth revisiting, possible templates, and quick value/outcome labels.
 
-The app distinguishes recorded evidence from unknown history. It can backfill file dates, known Lavish sessions, protected versions, and local Git commits; searches and library interactions begin recording with v0.2.
+The app distinguishes recorded evidence from unknown history. It can backfill file dates, known Lavish sessions, protected versions, and local Git commits; searches and library interactions begin recording with v0.2. Artifacts labelled **Disposable** or **Abandoned** are excluded from dormant gems even when they have revisions or agent replies.
 
 ## Versions
 
@@ -100,7 +100,28 @@ npm run build
 npm start
 ```
 
-The web UI listens on localhost and its filesystem companion service listens on `127.0.0.1:4318`. The companion service accepts browser requests only from `localhost` or `127.0.0.1` on the configured UI port, issues a fresh in-memory authorization token each time it starts, and limits artifact operations to files discovered by the same bounded scan used to build the library.
+By default, the web UI listens on `127.0.0.1:3000` and its filesystem companion service listens on `127.0.0.1:4318`. The default browser origins are `http://localhost:<UI port>` and `http://127.0.0.1:<UI port>`. The companion issues a fresh in-memory authorization token each time it starts and limits artifact operations to files discovered by the same bounded scan used to build the library. See [Optional private-network access](#optional-private-network-access) to configure access from other devices.
+
+### Optional private-network access
+
+To make both services reachable on a trusted private network, set `LAVISH_TRACKER_BIND_HOST` to the interface address or hostname to bind and set `LAVISH_TRACKER_ALLOWED_ORIGINS` to a comma-separated list of exact browser origins. An explicit allowlist replaces the default origins. Origins must include the scheme and port when one is used; paths, wildcards, and lists containing no origins are rejected. The companion accepts `Host` hostnames derived from those origins and the bind address. `LAVISH_TRACKER_UI_PORT` controls the UI port for both `npm run dev` and `npm start`; `LAVISH_TRACKER_API_PORT` controls the companion port. IPv6 bind addresses may be bracketed or unbracketed; URLs must use brackets, and binding to `::1` also adds `http://[::1]:<UI port>` to the default origins. Set `LAVISH_TRACKER_API_BASE` to the reachable IPv6 companion URL when using an IPv6-only bind.
+
+Both launch commands load settings from the project root before starting either service. Shell environment values take precedence, followed by `.env.<mode>.local`, `.env.local`, `.env.<mode>`, and `.env`, where `<mode>` is `development` for `npm run dev` and `production` for `npm start`. A shared `.env.local` can hold the bind host, origins, ports, and API base; these files are ignored by Git.
+
+For example, serve the UI and companion through separate HTTPS ports on a private-network hostname:
+
+```bash
+LAVISH_TRACKER_BIND_HOST=0.0.0.0 \
+LAVISH_TRACKER_ALLOWED_ORIGINS=https://library.example.com \
+LAVISH_TRACKER_API_BASE=https://library.example.com:8443 \
+npm run dev
+```
+
+Configure the HTTPS front to forward the UI port to the app and its separate companion port to the configured filesystem service port, preserving the hostname in `Host`. The companion's HTTPS port serves `/api/*` directly. `LAVISH_TRACKER_API_BASE` must be an absolute HTTP(S) URL reachable by the browser; relative API paths are unsupported. For direct private-network access, use the UI's exact origin and the companion's reachable URL. Changing the companion port also requires updating the API base, whose default remains `http://127.0.0.1:4318`. `LAVISH_TRACKER_API_BASE` is compiled into the UI, so set it while running `npm run build`. Supply the bind host, allowed origins, and any configured ports when starting a production build; changing the API base at startup requires rebuilding the UI.
+
+Binding to a non-loopback address without an explicit origin allowlist is refused at startup. Private-network reachability and the explicit origin allowlist are the trust boundary: there are no accounts or identity authentication. Any peer that can reach the companion and supply an allowed origin can obtain a token and read or modify the owner's discovered library, including restoring archived files. Use private-network access controls to limit reachable peers and HTTPS to protect data in transit. Non-allowlisted origins are rejected. In remote mode, every API read and mutation requires the per-start token even without browser headers; session bootstrap requires an allowed origin, and CORS preflight does not require a token. Header-free command-line clients connected over loopback can omit the token only when the companion is also bound to loopback.
+
+Files, archives, and native actions remain on the host Mac. Folder pickers, Finder reveals, and opening live or archived reviews execute there. Pasted project paths refer to folders on that Mac. This option exposes the library UI and companion; the Lavish review server retains its separate local configuration.
 
 ## License
 
@@ -112,6 +133,4 @@ Run `npm test`, `npm run lint`, `npm run typecheck`, and `npm run build`. Sessio
 
 Run `npm run test:backup-ui` with `chrome-devtools-axi` installed to exercise backup warnings, keyboard retry, last-success dates, and summary recovery in an isolated browser against synthetic data. This opt-in check does not use an installed Lavish library. Set `LAVISH_BACKUP_SCREENSHOT_DIR` to a local output folder to capture desktop and mobile warning layouts.
 
-CI uses the dedicated `ji7-lavish-library` runner on JI7 for main pushes and same-repository pull requests. Fork pull requests use GitHub-hosted Ubuntu runners. The repository Actions setting requires approval for **all external contributors**. The self-hosted job also checks the PR head repository before scheduling. Keep both protections in place; reviewing a fork workflow must include checking any changes to runner selection. Release Please stays on GitHub-hosted Ubuntu because it needs only GitHub API/token access.
-
-The JI7 runner runs as the `fm-manage` user service `actions-runner-ji7-lavish-library.service`, with labels `self-hosted`, `Linux`, `X64`, `ji7`, and `lavish-library`. Its installation is `/home/fm-manage/actions-runners/ji7-lavish-library`; its work directory is `_work`. It follows the existing user-systemd runner setup and is enabled at startup.
+CI runs tests, lint, type checks, and the production build on GitHub-hosted Ubuntu runners for main pushes and pull requests. Release Please also uses a GitHub-hosted runner.

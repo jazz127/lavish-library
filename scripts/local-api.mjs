@@ -7,13 +7,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { createPreviewCache } from './artifact-previews.mjs';
 import { artifactFailures, revisionContext, revealServerLog, serverLogPath } from './review-diagnostics.mjs';
+import { allowedHost, hostAuthority, isLoopbackHost, remoteAccessConfig } from './remote-access.mjs';
 
-const PORT = Number(process.env.LAVISH_TRACKER_API_PORT || 4318);
-const requestedUiPort = Number(process.env.LAVISH_TRACKER_UI_PORT || 3000);
-const UI_PORT = Number.isInteger(requestedUiPort) && requestedUiPort > 0 && requestedUiPort <= 65_535
-  ? requestedUiPort
-  : 3000;
-const HOST = '127.0.0.1';
+const remoteAccess = remoteAccessConfig();
+const PORT = remoteAccess.apiPort;
+const HOST = remoteAccess.bindHost;
 const STATE_FILE = process.env.LAVISH_AXI_STATE_DIR
   ? path.join(process.env.LAVISH_AXI_STATE_DIR, 'state.json')
   : path.join(os.homedir(), '.lavish-axi', 'state.json');
@@ -51,19 +49,17 @@ const idFor = (value) => createHash('sha1').update(value).digest('hex').slice(0,
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 const exists = async (value) => access(value, constants.F_OK).then(() => true).catch(() => false);
 const slug = (value) => String(value || 'untitled').normalize('NFKD').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '').toLowerCase().slice(0, 70) || 'untitled';
-const ALLOWED_WEB_ORIGINS = new Set([
-  `http://localhost:${UI_PORT}`,
-  `http://127.0.0.1:${UI_PORT}`,
-]);
+const ALLOWED_WEB_ORIGINS = remoteAccess.origins;
 
 async function readJson(file, fallback) {
   try { return JSON.parse(await readFile(file, 'utf8')); } catch { return fallback; }
 }
 
-async function writeJson(file, value) {
+async function writeJson(file, value, beforePublish) {
   await mkdir(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.tmp`;
   await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  if (beforePublish) await beforePublish();
   await rename(temporary, file);
 }
 
@@ -78,6 +74,12 @@ async function readConfig() {
 async function saveConfig(config) {
   await mkdir(CONFIG_DIR, { recursive: true });
   await writeJson(CONFIG_FILE, config);
+}
+
+async function requireActiveArchive(config) {
+  if ((await readConfig()).archiveRoot !== config.archiveRoot) {
+    throw new Error('Archive settings changed. Refresh the library and try again.');
+  }
 }
 
 function analyticsDefaults() {
@@ -447,20 +449,19 @@ async function readManifest(config, artifact) {
 }
 
 async function snapshotArtifactNow(config, artifact, reason = 'scan', supplementalAssets = []) {
-  if (!config.archiveRoot || !artifact.exists) return null;
+  if (!config.archiveRoot) return null;
+  await requireActiveArchive(config);
+  if (!artifact.exists) return null;
   const collected = await collectBundle(artifact.file, supplementalAssets);
   const { html, bundle, bundleSha256, watchDirs } = collected;
-  // Arm newly discovered dependency directories before publishing this version.
-  // A history reader can edit them as soon as the manifest rename is visible,
-  // even before that rename's completion resumes this snapshot operation.
-  const watcher = artifactWatchers.get(artifact.file);
-  if (watcher?.archiveRoot === config.archiveRoot) {
-    refreshArtifactWatchers(config, artifact, watcher, watchDirs);
-  }
   const contentSha = sha256(collected.htmlBytes);
   const manifest = await readManifest(config, artifact);
   const latest = manifest.versions.at(-1);
-  if (latest && await archivedBundleSha(config, artifact, latest).catch(() => null) === bundleSha256) return { manifest, watchDirs };
+  if (latest && await archivedBundleSha(config, artifact, latest).catch(() => null) === bundleSha256) {
+    await requireActiveArchive(config);
+    refreshArtifactWatchers(config, artifact, watchDirs);
+    return { manifest };
+  }
 
   const sourceStat = await stat(artifact.file);
   const createdAt = new Date().toISOString();
@@ -497,8 +498,11 @@ async function snapshotArtifactNow(config, artifact, reason = 'scan', supplement
     reason,
     file: path.relative(artifactArchiveDir(config, artifact), archivedFile),
   });
-  await writeJson(manifestPath(config, artifact), manifest);
-  return { manifest, watchDirs };
+  await writeJson(manifestPath(config, artifact), manifest, async () => {
+    await requireActiveArchive(config);
+    refreshArtifactWatchers(config, artifact, watchDirs);
+  });
+  return { manifest };
 }
 
 function queueArtifactOperation(artifact, operation) {
@@ -523,8 +527,18 @@ function closeArtifactWatchers() {
   artifactWatchers.clear();
 }
 
-function refreshArtifactWatchers(config, artifact, entry, watchDirs) {
-  if (artifactWatchers.get(artifact.file) !== entry) return;
+function refreshArtifactWatchers(config, artifact, watchDirs) {
+  let entry = artifactWatchers.get(artifact.file);
+  if (entry && entry.archiveRoot !== config.archiveRoot) {
+    closeWatcherEntry(entry);
+    artifactWatchers.delete(artifact.file);
+    entry = null;
+  }
+  if (!entry) {
+    entry = { watchers: new Map(), timer: null, archiveRoot: config.archiveRoot };
+    artifactWatchers.set(artifact.file, entry);
+  }
+  entry.refreshToken = {};
   for (const [directory, watcher] of entry.watchers) {
     if (!watchDirs.has(directory)) {
       watcher.close();
@@ -555,28 +569,21 @@ function refreshArtifactWatchers(config, artifact, entry, watchDirs) {
   }
 }
 
-function syncArtifactWatchers(config, artifacts, watchDirsByFile) {
+async function syncArtifactWatchers(config, artifacts, watcherOwners) {
+  if ((await readConfig()).archiveRoot !== config.archiveRoot) return;
   if (!config.archiveRoot) return closeArtifactWatchers();
   const targets = new Set(artifacts.filter((artifact) => artifact.exists).map((artifact) => artifact.file));
   for (const [file, entry] of artifactWatchers) {
+    if (watcherOwners.get(file) !== entry.refreshToken) continue;
     if (!targets.has(file) || entry.archiveRoot !== config.archiveRoot) {
       closeWatcherEntry(entry);
       artifactWatchers.delete(file);
     }
   }
-  for (const artifact of artifacts) {
-    if (!artifact.exists) continue;
-    let entry = artifactWatchers.get(artifact.file);
-    if (!entry) {
-      entry = { watchers: new Map(), timer: null, archiveRoot: config.archiveRoot };
-      artifactWatchers.set(artifact.file, entry);
-    }
-    const watchDirs = watchDirsByFile.get(artifact.file);
-    if (watchDirs) refreshArtifactWatchers(config, artifact, entry, watchDirs);
-  }
 }
 
 async function buildLibrary() {
+  const watcherOwners = new Map([...artifactWatchers].map(([file, entry]) => [file, entry.refreshToken]));
   const [knownArtifacts, config, running, logPath] = await Promise.all([
     scanKnownArtifacts({ force: true }),
     readConfig(),
@@ -624,7 +631,6 @@ async function buildLibrary() {
   let totalVersions = 0;
   let protectedArtifacts = 0;
   let failedArtifacts = 0;
-  const watchDirsByFile = new Map();
   if (config.archiveRoot) {
     for (const artifact of artifacts) {
       let manifest;
@@ -632,7 +638,6 @@ async function buildLibrary() {
       try {
         const snapshot = artifact.exists ? await snapshotArtifact(config, artifact, 'scan') : null;
         manifest = snapshot?.manifest || await readManifest(config, artifact);
-        if (snapshot) watchDirsByFile.set(artifact.file, snapshot.watchDirs);
         latestProtected = Boolean(snapshot);
       } catch (error) {
         artifact.backupError = error instanceof Error ? error.message : 'Backup failed';
@@ -647,7 +652,7 @@ async function buildLibrary() {
       if (latestProtected && artifact.versionCount > 0) protectedArtifacts += 1;
     }
   }
-  syncArtifactWatchers(config, artifacts, watchDirsByFile);
+  await syncArtifactWatchers(config, artifacts, watcherOwners);
   for (const artifact of artifacts) if (artifact.exists) previews.schedule(artifact);
 
   const projects = [...projectMap.values(), ...(hasLoose ? [looseProject] : [])].map((project) => ({
@@ -844,19 +849,8 @@ async function restoreVersion(file, versionId) {
       }
     }
     artifact.exists = true;
-    const snapshot = await snapshotArtifactNow(config, artifact, 'restore', version.supplementalAssets || []);
+    await snapshotArtifactNow(config, artifact, 'restore', version.supplementalAssets || []);
     knownArtifactsCache = { key: '', at: 0, value: null, pending: null };
-    let watcher = artifactWatchers.get(artifact.file);
-    if (watcher && watcher.archiveRoot !== config.archiveRoot) {
-      closeWatcherEntry(watcher);
-      artifactWatchers.delete(artifact.file);
-      watcher = null;
-    }
-    if (!watcher) {
-      watcher = { watchers: new Map(), timer: null, archiveRoot: config.archiveRoot };
-      artifactWatchers.set(artifact.file, watcher);
-    }
-    refreshArtifactWatchers(config, artifact, watcher, snapshot.watchDirs);
     return resolved;
   });
 }
@@ -1126,7 +1120,7 @@ function tokenAllowed(value) {
 }
 
 function hostAllowed(value) {
-  return value === `${HOST}:${PORT}` || value === `localhost:${PORT}`;
+  return allowedHost(value, remoteAccess);
 }
 
 function json(res, status, value, origin = '') {
@@ -1189,12 +1183,12 @@ const server = createServer(async (req, res) => {
     return res.end();
   }
   try {
-    const url = new URL(req.url, `http://${HOST}:${PORT}`);
+    const url = new URL(req.url, `http://${hostAuthority(HOST)}:${PORT}`);
     if (req.method === 'GET' && url.pathname === '/api/session') {
       if (!origin) return json(res, 403, { error: 'Open Lavish Library in its local browser page first.' });
       return json(res, 200, { token: API_TOKEN }, origin);
     }
-    if (origin && url.pathname.startsWith('/api/') && !tokenAllowed(req.headers['x-lavish-token'])) {
+    if ((origin || !remoteAccess.isLoopback || !isLoopbackHost(req.socket.remoteAddress)) && url.pathname.startsWith('/api/') && !tokenAllowed(req.headers['x-lavish-token'])) {
       return json(res, 401, { error: 'The local browser session is not authorized.' }, origin);
     }
     if (req.method === 'GET' && url.pathname === '/api/library') return json(res, 200, await buildLibrary(), origin);
@@ -1350,4 +1344,4 @@ const server = createServer(async (req, res) => {
 
 const periodicScan = setInterval(() => buildLibrary().catch(() => {}), 30_000);
 periodicScan.unref();
-server.listen(PORT, HOST, () => console.log(`Lavish Tracker library service: http://${HOST}:${PORT}`));
+server.listen(PORT, HOST, () => console.log(`Lavish Tracker library service: http://${hostAuthority(HOST)}:${PORT}`));

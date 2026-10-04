@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
-async function fixture(run, { pauseAfterVersion } = {}) {
+async function fixture(run, { pauseAfterVersion, pauseArchiveName = 'archive', pauseReason, pauseReadFile, pauseReadArchiveName = 'archive', pauseBeforePublication = false } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'lavish-bundle-'));
   const sourceDir = path.join(directory, 'project', '.lavish');
   const stateDir = path.join(directory, 'state');
@@ -29,7 +29,8 @@ async function fixture(run, { pauseAfterVersion } = {}) {
   const port = socket.address().port;
   await new Promise((resolve) => socket.close(resolve));
   const serviceArgs = [];
-  if (pauseAfterVersion) {
+  const pauseEnabled = Boolean(pauseAfterVersion || pauseReadFile || pauseBeforePublication);
+  if (pauseEnabled) {
     // Hold the manifest rename's completion after its bytes become observable.
     // IPC lets the test delete a dependency in that window without a timed sleep.
     const preload = path.join(directory, 'pause-manifest.mjs');
@@ -38,14 +39,34 @@ async function fixture(run, { pauseAfterVersion } = {}) {
       import { once } from 'node:events';
       import { syncBuiltinESMExports } from 'node:module';
       const rename = fs.rename;
+      const readFile = fs.readFile;
+      const writeFile = fs.writeFile;
+      let paused = false;
+      const pause = async (message) => {
+        paused = true;
+        const resumed = once(process, 'message');
+        process.send(message);
+        await resumed;
+      };
+      fs.readFile = async (file, ...args) => {
+        const bytes = await readFile(file, ...args);
+        if (!paused && ${Boolean(pauseReadFile)} && file === ${JSON.stringify(path.join(sourceDir, pauseReadFile || ''))}) {
+          const config = JSON.parse(await readFile(${JSON.stringify(path.join(configDir, 'config.json'))}, 'utf8'));
+          if (config.archiveRoot === ${JSON.stringify(path.join(directory, pauseReadArchiveName))}) await pause('read-paused');
+        }
+        return bytes;
+      };
+      fs.writeFile = async (file, ...args) => {
+        await writeFile(file, ...args);
+        if (!paused && ${pauseBeforePublication} && file.endsWith('/manifest.json.' + process.pid + '.tmp')) await pause('publication-paused');
+      };
       fs.rename = async (source, destination) => {
         await rename(source, destination);
-        if (!destination.endsWith('/manifest.json')) return;
+        if (paused || !destination.endsWith('/manifest.json') || !destination.startsWith(${JSON.stringify(path.join(directory, pauseArchiveName) + path.sep)})) return;
         const manifest = JSON.parse(await fs.readFile(destination, 'utf8'));
-        if (manifest.versions.length !== ${pauseAfterVersion}) return;
-        const resumed = once(process, 'message');
-        process.send('manifest-published');
-        await resumed;
+        if (manifest.versions.length !== ${pauseAfterVersion || 0}) return;
+        if (${JSON.stringify(pauseReason || '')} && manifest.versions.at(-1).reason !== ${JSON.stringify(pauseReason || '')}) return;
+        await pause('manifest-published');
       };
       syncBuiltinESMExports();
     `);
@@ -53,9 +74,9 @@ async function fixture(run, { pauseAfterVersion } = {}) {
   }
   const service = spawn(process.execPath, [...serviceArgs, 'scripts/local-api.mjs'], {
     env: { ...process.env, LAVISH_TRACKER_API_PORT: String(port), LAVISH_TRACKER_CONFIG_DIR: configDir, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_AXI_BIN: '/usr/bin/true' },
-    stdio: pauseAfterVersion ? ['ignore', 'ignore', 'ignore', 'ipc'] : 'ignore',
+    stdio: pauseEnabled ? ['ignore', 'ignore', 'ignore', 'ipc'] : 'ignore',
   });
-  const publicationPaused = pauseAfterVersion ? once(service, 'message') : null;
+  const publicationPaused = pauseEnabled ? once(service, 'message') : null;
   const exited = once(service, 'exit');
   const api = `http://127.0.0.1:${port}/api`;
   const get = async (route) => {
@@ -95,7 +116,7 @@ async function waitForVersion(history, count) {
 
 test('reconciliation archives asset-only edits and current compares the complete bundle', async () => {
   await fixture(async ({ sourceDir, get, post, history }) => {
-    await post('/artifacts/snapshot'); // No watcher installed: reconciliation must catch the edit.
+    await post('/artifacts/snapshot');
     const baseline = (await history()).versions[0];
     await writeFile(path.join(sourceDir, 'assets/logo.png'), 'logo-two');
     assert.equal((await history()).versions.some((version) => version.isCurrent), false);
@@ -110,6 +131,190 @@ test('reconciliation archives asset-only edits and current compares the complete
     assert.equal((await history()).versions.length, 2);
   });
 });
+
+async function editPublishedDependency(context, publication, versionCount) {
+  const { sourceDir, history, publicationPaused, resumePublication } = context;
+  assert.equal((await publicationPaused)[0], 'manifest-published');
+  const published = await history();
+  assert.equal(published.versions.length, versionCount);
+  const icon = path.join(sourceDir, 'assets/nested/icon.png');
+  await writeFile(icon, 'edited-after-publication');
+  resumePublication();
+  await publication;
+  const changed = await waitForVersion(history, versionCount + 1);
+  assert.equal(changed.versions[0].reason, 'change');
+  assert.equal(changed.versions[0].isCurrent, true);
+  assert.equal(await readFile(path.join(changed.archivePath, path.dirname(changed.versions[0].file), 'assets/nested/icon.png'), 'utf8'), 'edited-after-publication');
+  assert.equal(await readFile(path.join(published.archivePath, path.dirname(published.versions[0].file), 'assets/nested/icon.png'), 'utf8'), 'icon-one');
+  return changed;
+}
+
+test('manual snapshot watches dependencies before its first manifest is published', { timeout: 15_000 }, async () => {
+  await fixture(async (context) => {
+    await editPublishedDependency(context, context.post('/artifacts/snapshot'), 1);
+  }, { pauseAfterVersion: 1 });
+});
+
+test('initial archive setup watches each artifact before its baseline is published', { timeout: 15_000 }, async () => {
+  await fixture(async (context) => {
+    const { directory, sourceDir, file, get } = context;
+    const configFile = path.join(directory, 'config/config.json');
+    await writeFile(configFile, JSON.stringify({ projects: [], archiveRoot: null }));
+    const secondFile = path.join(sourceDir, 'other/second.html');
+    await mkdir(path.dirname(secondFile));
+    await writeFile(secondFile, '<title>Second artifact</title>');
+    await writeFile(path.join(directory, 'state/state.json'), JSON.stringify({ sessions: { demo: { file }, second: { file: secondFile } } }));
+    assert.equal((await get('/library')).artifacts.length, 2);
+    await writeFile(configFile, JSON.stringify({ projects: [], archiveRoot: path.join(directory, 'archive') }));
+    await editPublishedDependency(context, get('/library'), 1);
+    await writeFile(secondFile, '<title>Second artifact edited</title>');
+    const secondHistory = () => get(`/artifacts/versions?file=${encodeURIComponent(secondFile)}`);
+    const secondChanged = await waitForVersion(secondHistory, 2);
+    assert.equal(secondChanged.versions[0].reason, 'change');
+    assert.equal(await readFile(path.join(secondChanged.archivePath, secondChanged.versions[0].file), 'utf8'), '<title>Second artifact edited</title>');
+  }, { pauseAfterVersion: 1 });
+});
+
+test('archive switches replace dependency watchers before publishing the new baseline', { timeout: 15_000 }, async () => {
+  await fixture(async (context) => {
+    const { directory, get } = context;
+    await get('/library');
+    const nextArchive = path.join(directory, 'archive-next');
+    await writeFile(path.join(directory, 'config/config.json'), JSON.stringify({ projects: [], archiveRoot: nextArchive }));
+    const changed = await editPublishedDependency(context, get('/library'), 1);
+    assert.equal(changed.archivePath.startsWith(nextArchive + path.sep), true);
+  }, { pauseAfterVersion: 1, pauseArchiveName: 'archive-next' });
+});
+
+test('missing-source restore watches recreated dependencies before publishing its version', { timeout: 15_000 }, async () => {
+  await fixture(async (context) => {
+    const { file, post, get, history } = context;
+    await post('/artifacts/snapshot');
+    const baseline = (await history()).versions[0];
+    await writeFile(file, '<title>Newer document</title>');
+    await post('/artifacts/snapshot');
+    await rm(file);
+    await get('/library');
+    await editPublishedDependency(context, post('/versions/restore', { file, versionId: baseline.id }), 3);
+  }, { pauseAfterVersion: 3, pauseReason: 'restore' });
+});
+
+test('deduplicated snapshots rearm dependency watchers after archive is re-enabled', async () => {
+  await fixture(async ({ directory, sourceDir, post, history }) => {
+    await post('/artifacts/snapshot');
+    await post('/archive/disable', {});
+    await writeFile(path.join(directory, 'config/config.json'), JSON.stringify({ projects: [], archiveRoot: path.join(directory, 'archive') }));
+    await post('/artifacts/snapshot');
+    assert.equal((await history()).versions.length, 1);
+    await writeFile(path.join(sourceDir, 'assets/nested/icon.png'), 'changed-after-rearming');
+    const changed = await waitForVersion(history, 2);
+    assert.equal(changed.versions[0].reason, 'change');
+    assert.equal(await readFile(path.join(changed.archivePath, path.dirname(changed.versions[0].file), 'assets/nested/icon.png'), 'utf8'), 'changed-after-rearming');
+  });
+});
+
+for (const [stage, options] of [
+  ['collection', { pauseReadFile: 'assets/nested/icon.png' }],
+  ['publication', { pauseBeforePublication: true }],
+]) {
+  test(`pause during ${stage} prevents a pending snapshot from publishing or restarting backups`, { timeout: 15_000 }, async () => {
+    await fixture(async ({ sourceDir, file, api, post, get, history, publicationPaused, resumePublication }) => {
+      const pending = fetch(`${api}/artifacts/snapshot`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ file }) });
+      await publicationPaused;
+      const archived = await history();
+      await post('/archive/disable', {});
+      assert.equal((await get('/library')).archive.enabled, false);
+      resumePublication();
+      const response = await pending;
+      assert.equal(response.status, 400);
+      assert.match((await response.json()).error, /Archive settings changed/);
+      await writeFile(path.join(sourceDir, 'assets/nested/icon.png'), 'edited-while-paused');
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      await assert.rejects(readFile(path.join(archived.archivePath, 'manifest.json')), { code: 'ENOENT' });
+    }, options);
+  });
+}
+
+test('an old autosave queued behind an archive switch cannot reclaim the new watchers', { timeout: 15_000 }, async () => {
+  await fixture(async ({ directory, sourceDir, post, get, history, publicationPaused, resumePublication }) => {
+    await post('/artifacts/snapshot');
+    const previous = await history();
+    const nextArchive = path.join(directory, 'archive-next');
+    await writeFile(path.join(directory, 'config/config.json'), JSON.stringify({ projects: [], archiveRoot: nextArchive }));
+    const scanning = get('/library');
+    assert.equal((await publicationPaused)[0], 'read-paused');
+    const icon = path.join(sourceDir, 'assets/nested/icon.png');
+    await writeFile(icon, 'edited-during-switch');
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    resumePublication();
+    await scanning;
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    const oldManifest = JSON.parse(await readFile(path.join(previous.archivePath, 'manifest.json'), 'utf8'));
+    assert.equal(oldManifest.versions.length, 1);
+    await writeFile(icon, 'new-archive-only');
+    const changed = await waitForVersion(history, 2);
+    assert.equal(changed.archivePath.startsWith(nextArchive + path.sep), true);
+    assert.equal(changed.versions[0].reason, 'change');
+    assert.equal(await readFile(path.join(changed.archivePath, path.dirname(changed.versions[0].file), 'assets/nested/icon.png'), 'utf8'), 'new-archive-only');
+  }, { pauseReadFile: 'assets/nested/icon.png', pauseReadArchiveName: 'archive-next' });
+});
+
+test('superseded scan cleanup leaves the active archive watchers intact', { timeout: 15_000 }, async () => {
+  await fixture(async ({ directory, sourceDir, get, history, publicationPaused, resumePublication }) => {
+    const oldScan = get('/library');
+    assert.equal((await publicationPaused)[0], 'read-paused');
+    const nextArchive = path.join(directory, 'archive-next');
+    await writeFile(path.join(directory, 'config/config.json'), JSON.stringify({ projects: [], archiveRoot: nextArchive }));
+    const active = await get('/library');
+    assert.equal(active.archive.root, nextArchive);
+    assert.equal(active.archive.totalVersions, 1);
+    resumePublication();
+    await oldScan;
+    await writeFile(path.join(sourceDir, 'assets/nested/icon.png'), 'active-scan-watchers');
+    const changed = await waitForVersion(history, 2);
+    assert.equal(changed.versions[0].reason, 'change');
+    assert.equal(await readFile(path.join(changed.archivePath, path.dirname(changed.versions[0].file), 'assets/nested/icon.png'), 'utf8'), 'active-scan-watchers');
+  }, { pauseReadFile: 'plan.html' });
+});
+
+for (const keepExisting of [false, true]) {
+  test(`a stale same-archive scan preserves ${keepExisting ? 'refreshed' : 'newly installed'} restore watchers`, { timeout: 15_000 }, async () => {
+    await fixture(async ({ directory, sourceDir, file, html, get, post, publicationPaused, resumePublication }) => {
+      const secondDir = path.join(sourceDir, 'recovery');
+      const secondFile = path.join(secondDir, 'second.html');
+      const secondHtml = '<title>Recovered artifact</title><img src="nested/icon.png">';
+      const icon = path.join(secondDir, 'nested/icon.png');
+      await mkdir(path.dirname(icon), { recursive: true });
+      await writeFile(secondFile, secondHtml);
+      await writeFile(icon, 'recovery-baseline');
+      await writeFile(path.join(directory, 'state/state.json'), JSON.stringify({ sessions: { demo: { file }, second: { file: secondFile } } }));
+      await post('/artifacts/snapshot');
+      await post('/artifacts/snapshot', { file: secondFile });
+      const secondHistory = () => get(`/artifacts/versions?file=${encodeURIComponent(secondFile)}`);
+      const baseline = (await secondHistory()).versions[0];
+      await rm(secondFile);
+      if (!keepExisting) await get('/library');
+      await writeFile(file, `${html}<p>Changed before scanning</p>`);
+      const scanning = get('/library');
+      assert.equal((await publicationPaused)[0], 'manifest-published');
+      const restored = await post('/versions/restore', { file: secondFile, versionId: baseline.id });
+      assert.equal(restored.sourceRecreated, true);
+      resumePublication();
+      const stale = await scanning;
+      assert.equal(stale.artifacts.find((artifact) => artifact.file === secondFile).exists, false);
+      await writeFile(icon, 'edited-after-restoring');
+      const assetChange = await waitForVersion(secondHistory, 2);
+      assert.equal(assetChange.versions[0].reason, 'change');
+      assert.equal(await readFile(path.join(assetChange.archivePath, path.dirname(assetChange.versions[0].file), 'nested/icon.png'), 'utf8'), 'edited-after-restoring');
+      const updatedHtml = `${secondHtml}<p>Changed after restoring</p>`;
+      await writeFile(`${secondFile}.tmp`, updatedHtml);
+      await rename(`${secondFile}.tmp`, secondFile);
+      const htmlChange = await waitForVersion(secondHistory, 3);
+      assert.equal(htmlChange.versions[0].reason, 'change');
+      assert.equal(await readFile(path.join(htmlChange.archivePath, htmlChange.versions[0].file), 'utf8'), updatedHtml);
+    }, { pauseAfterVersion: 2 });
+  });
+}
 
 test('directory watchers archive nested assets and survive atomic replacement', async () => {
   await fixture(async ({ sourceDir, get, history, publicationPaused, resumePublication }) => {
