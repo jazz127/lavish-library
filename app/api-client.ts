@@ -1,10 +1,14 @@
-const API_ORIGIN = 'http://127.0.0.1:4318';
+declare const __LAVISH_TRACKER_API_BASE__: string;
+
+const API_BASE = (typeof __LAVISH_TRACKER_API_BASE__ === 'string'
+  ? __LAVISH_TRACKER_API_BASE__
+  : 'http://127.0.0.1:4318').replace(/\/$/, '');
 
 let tokenPromise: Promise<string> | null = null;
 
 async function sessionToken() {
   if (!tokenPromise) {
-    tokenPromise = fetch(`${API_ORIGIN}/api/session`, { cache: 'no-store' })
+    tokenPromise = fetch(`${API_BASE}/api/session`, { cache: 'no-store' })
       .then(async (response) => {
         const result = await response.json();
         if (!response.ok || typeof result.token !== 'string') throw new Error(result.error || 'Could not authorize the local library service.');
@@ -22,7 +26,7 @@ async function request(path: string, init: RequestInit, retry: boolean): Promise
   const token = await sessionToken();
   const headers = new Headers(init.headers);
   headers.set('x-lavish-token', token);
-  const response = await fetch(`${API_ORIGIN}/api${path}`, { ...init, headers });
+  const response = await fetch(`${API_BASE}/api${path}`, { ...init, headers });
   if (response.status === 401 && retry) {
     tokenPromise = null;
     return request(path, init, false);

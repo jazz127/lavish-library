@@ -7,13 +7,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { createPreviewCache } from './artifact-previews.mjs';
 import { artifactFailures, revisionContext, revealServerLog, serverLogPath } from './review-diagnostics.mjs';
+import { allowedHost, remoteAccessConfig } from './remote-access.mjs';
 
 const PORT = Number(process.env.LAVISH_TRACKER_API_PORT || 4318);
-const requestedUiPort = Number(process.env.LAVISH_TRACKER_UI_PORT || 3000);
-const UI_PORT = Number.isInteger(requestedUiPort) && requestedUiPort > 0 && requestedUiPort <= 65_535
-  ? requestedUiPort
-  : 3000;
-const HOST = '127.0.0.1';
+const remoteAccess = remoteAccessConfig();
+const HOST = remoteAccess.bindHost;
 const STATE_FILE = process.env.LAVISH_AXI_STATE_DIR
   ? path.join(process.env.LAVISH_AXI_STATE_DIR, 'state.json')
   : path.join(os.homedir(), '.lavish-axi', 'state.json');
@@ -51,10 +49,7 @@ const idFor = (value) => createHash('sha1').update(value).digest('hex').slice(0,
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 const exists = async (value) => access(value, constants.F_OK).then(() => true).catch(() => false);
 const slug = (value) => String(value || 'untitled').normalize('NFKD').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '').toLowerCase().slice(0, 70) || 'untitled';
-const ALLOWED_WEB_ORIGINS = new Set([
-  `http://localhost:${UI_PORT}`,
-  `http://127.0.0.1:${UI_PORT}`,
-]);
+const ALLOWED_WEB_ORIGINS = remoteAccess.origins;
 
 async function readJson(file, fallback) {
   try { return JSON.parse(await readFile(file, 'utf8')); } catch { return fallback; }
@@ -1126,7 +1121,7 @@ function tokenAllowed(value) {
 }
 
 function hostAllowed(value) {
-  return value === `${HOST}:${PORT}` || value === `localhost:${PORT}`;
+  return allowedHost(value, remoteAccess);
 }
 
 function json(res, status, value, origin = '') {

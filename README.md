@@ -102,6 +102,23 @@ npm start
 
 The web UI listens on localhost and its filesystem companion service listens on `127.0.0.1:4318`. The companion service accepts browser requests only from `localhost` or `127.0.0.1` on the configured UI port, issues a fresh in-memory authorization token each time it starts, and limits artifact operations to files discovered by the same bounded scan used to build the library.
 
+### Optional private-network access
+
+By default, both services remain limited to the local Mac. To make the UI reachable on a private network, set `LAVISH_TRACKER_BIND_HOST` to the interface address or hostname to bind and set `LAVISH_TRACKER_ALLOWED_ORIGINS` to a comma-separated list of exact browser origins. Origins must include the scheme and port when one is used; paths and wildcards are rejected. The companion accepts `Host` values derived from those origins. Set `LAVISH_TRACKER_ALLOWED_HOSTS` to a comma-separated list of explicit hostnames only when a reverse proxy uses a different `Host` value.
+
+For example, an HTTPS reverse proxy can bind the app on a private interface, allow its public-facing origin, and send a same-origin API path to the companion:
+
+```bash
+LAVISH_TRACKER_BIND_HOST=0.0.0.0 \
+LAVISH_TRACKER_ALLOWED_ORIGINS=https://library.example.ts.net \
+LAVISH_TRACKER_API_BASE=/companion-api \
+npm run dev
+```
+
+Configure the proxy to serve the UI and forward `/companion-api/api/*` to the companion service's `/api/*` endpoints. If the proxy sends a `Host` value whose hostname differs from the allowed origin, add that hostname to `LAVISH_TRACKER_ALLOWED_HOSTS`. For direct access without a proxy, set `LAVISH_TRACKER_API_BASE` to the companion's reachable URL and use an origin reachable by the browser. The bind address, browser origin allowlist, host allowlist, and browser-facing API base are independent settings. `LAVISH_TRACKER_API_BASE` is compiled into the UI, so set it while running `npm run build` as well as when starting a production build.
+
+Binding to a non-loopback address without an explicit origin allowlist is refused at startup. Keep the app on a trusted private network and use HTTPS through a trusted proxy when credentials or library data cross the network. The per-start companion authorization token remains required for browser API calls, and artifact operations remain limited to files found by the bounded library scan.
+
 ## License
 
 [MIT](LICENSE) © 2026 Jarad Smith

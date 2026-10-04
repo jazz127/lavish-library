@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { request as httpRequest } from 'node:http';
 import { mkdtemp, mkdir, readdir, writeFile } from 'node:fs/promises';
 import { after, before, test } from 'node:test';
 import os from 'node:os';
@@ -34,6 +35,18 @@ async function post(route, value) {
   const result = await response.json();
   assert.equal(response.ok, true, result.error);
   return result;
+}
+
+function requestWithHost(url, headers) {
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(url, { headers }, (response) => {
+      const chunks = [];
+      response.on('data', (chunk) => chunks.push(chunk));
+      response.on('end', () => resolve({ status: response.statusCode, headers: response.headers, body: Buffer.concat(chunks).toString('utf8') }));
+    });
+    request.on('error', reject);
+    request.end();
+  });
 }
 
 before(async () => {
@@ -137,6 +150,58 @@ test('rejects hostile browser origins and requires a session token', async () =>
   const ipSession = await fetch(`${api}/session`, { headers: { origin: ipOrigin } });
   assert.equal(ipSession.status, 200);
   assert.equal(ipSession.headers.get('access-control-allow-origin'), ipOrigin);
+});
+
+test('accepts only configured origins and hosts for private-network access', async () => {
+  const remotePort = port + 2;
+  const remoteApi = `http://127.0.0.1:${remotePort}/api`;
+  const remoteOrigin = 'https://library.example.ts.net';
+  const proxyHost = 'proxy.example.ts.net';
+  const remoteFixture = await mkdtemp(path.join(os.tmpdir(), 'lavish-tracker-remote-test-'));
+  const remoteConfig = path.join(remoteFixture, 'config');
+  const remoteState = path.join(remoteFixture, 'state');
+  await Promise.all([mkdir(remoteConfig, { recursive: true }), mkdir(remoteState, { recursive: true })]);
+  await writeFile(path.join(remoteConfig, 'config.json'), JSON.stringify({ projects: [], archiveRoot: null }));
+  await writeFile(path.join(remoteState, 'state.json'), JSON.stringify({ sessions: {} }));
+
+  const remoteService = spawn(process.execPath, [path.join(root, 'scripts/local-api.mjs')], {
+    cwd: root,
+    env: {
+      ...process.env,
+      LAVISH_TRACKER_API_PORT: String(remotePort),
+      LAVISH_TRACKER_UI_PORT: '3007',
+      LAVISH_TRACKER_BIND_HOST: '127.0.0.1',
+      LAVISH_TRACKER_ALLOWED_ORIGINS: remoteOrigin,
+      LAVISH_TRACKER_ALLOWED_HOSTS: proxyHost,
+      LAVISH_TRACKER_CONFIG_DIR: remoteConfig,
+      LAVISH_AXI_STATE_DIR: remoteState,
+      LAVISH_AXI_BIN: '/usr/bin/true',
+    },
+    stdio: 'ignore',
+  });
+
+  try {
+    await waitForService(remotePort);
+    const accepted = await requestWithHost(`${remoteApi}/session`, { origin: remoteOrigin, host: proxyHost });
+    const session = JSON.parse(accepted.body);
+    assert.equal(accepted.status, 200);
+    assert.equal(accepted.headers['access-control-allow-origin'], remoteOrigin);
+    assert.equal(typeof session.token, 'string');
+
+    const unauthorized = await requestWithHost(`${remoteApi}/library`, { origin: remoteOrigin, host: proxyHost });
+    assert.equal(unauthorized.status, 401);
+    const authorized = await requestWithHost(`${remoteApi}/library`, { origin: remoteOrigin, host: proxyHost, 'x-lavish-token': session.token });
+    assert.equal(authorized.status, 200);
+
+    const rejectedOrigin = await requestWithHost(`${remoteApi}/session`, { origin: 'https://other.example.ts.net', host: proxyHost });
+    assert.equal(rejectedOrigin.status, 403);
+    assert.equal(rejectedOrigin.headers['access-control-allow-origin'], undefined);
+
+    const rejectedHost = await requestWithHost(`${remoteApi}/session`, { origin: remoteOrigin, host: 'other.example.ts.net' });
+    assert.equal(rejectedHost.status, 403);
+  } finally {
+    remoteService.kill('SIGTERM');
+  }
 });
 
 test('ignores archive side effects when resolving one artifact', async () => {
