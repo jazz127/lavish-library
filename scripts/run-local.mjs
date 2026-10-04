@@ -1,10 +1,12 @@
 import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { loadDotenv } from 'vinext/internal/config/dotenv';
 import { remoteAccessConfig } from './remote-access.mjs';
 
 const mode = process.argv[2] === 'start' ? 'start' : 'dev';
-const remoteAccess = remoteAccessConfig();
 const root = process.cwd();
+loadDotenv({ root, mode: mode === 'start' ? 'production' : 'development' });
+const remoteAccess = remoteAccessConfig();
 const bin = path.join(root, 'node_modules', '.bin', 'vinext');
 const api = spawn(process.execPath, [path.join(root, 'scripts', 'local-api.mjs')], { stdio: 'inherit' });
 const site = spawn(bin, mode === 'start'
