@@ -138,13 +138,16 @@ export default function Home() {
   const [backingUp, setBackingUp] = useState<string[]>([]);
   const searchRef = useRef<HTMLInputElement>(null);
   const trackedSearchRef = useRef('');
+  const libraryRequestRef = useRef(0);
 
   async function loadLibrary(quiet = false) {
+    const request = ++libraryRequestRef.current;
     if (!quiet) setLoading(true);
     try {
       const response = await apiFetch('/library', { cache: 'no-store' });
       if (!response.ok) throw new Error('The local library service did not respond.');
       const value: Library = await response.json();
+      if (request !== libraryRequestRef.current) return;
       setLibrary(value);
       setNotice('');
       return value;
@@ -157,17 +160,34 @@ export default function Home() {
 
   useEffect(() => {
     const controller = new AbortController();
-    apiFetch('/library', { cache: 'no-store', signal: controller.signal })
-      .then((response) => {
+    let pending = false;
+    const refresh = async () => {
+      if (pending || document.visibilityState === 'hidden') return;
+      pending = true;
+      const request = ++libraryRequestRef.current;
+      try {
+        const response = await apiFetch('/library', { cache: 'no-store', signal: controller.signal });
         if (!response.ok) throw new Error('The local library service did not respond.');
-        return response.json();
-      })
-      .then((value) => setLibrary(value))
-      .catch((error) => {
-        if (error instanceof Error && error.name !== 'AbortError') setNotice(error.message);
-      })
-      .finally(() => setLoading(false));
-    return () => controller.abort();
+        const value: Library = await response.json();
+        if (!controller.signal.aborted && request === libraryRequestRef.current) setLibrary(value);
+      } catch (error) {
+        if (!controller.signal.aborted && request === libraryRequestRef.current && error instanceof Error) setNotice(error.message);
+      } finally {
+        pending = false;
+        if (!controller.signal.aborted) setLoading(false);
+      }
+    };
+    void refresh();
+    const timer = window.setInterval(() => void refresh(), 5000);
+    const resume = () => void refresh();
+    window.addEventListener('focus', resume);
+    document.addEventListener('visibilitychange', resume);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+      window.removeEventListener('focus', resume);
+      document.removeEventListener('visibilitychange', resume);
+    };
   }, []);
 
   useEffect(() => {

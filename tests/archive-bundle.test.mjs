@@ -1,13 +1,13 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
-async function fixture(run, { pauseAfterVersion, pauseArchiveName = 'archive', pauseReason, pauseReadFile, pauseReadArchiveName = 'archive', pauseBeforePublication = false } = {}) {
+async function fixture(run, { pauseAfterVersion, pauseArchiveName = 'archive', pauseReason, pauseReadFile, pauseReadArchiveName = 'archive', pauseBeforePublication = false, pauseRestoreWrite = false, trackArchiveReads = false } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'lavish-bundle-'));
   const sourceDir = path.join(directory, 'project', '.lavish');
   const stateDir = path.join(directory, 'state');
@@ -29,7 +29,7 @@ async function fixture(run, { pauseAfterVersion, pauseArchiveName = 'archive', p
   const port = socket.address().port;
   await new Promise((resolve) => socket.close(resolve));
   const serviceArgs = [];
-  const pauseEnabled = Boolean(pauseAfterVersion || pauseReadFile || pauseBeforePublication);
+  const pauseEnabled = Boolean(pauseAfterVersion || pauseReadFile || pauseBeforePublication || pauseRestoreWrite || trackArchiveReads);
   if (pauseEnabled) {
     // Hold the manifest rename's completion after its bytes become observable.
     // IPC lets the test delete a dependency in that window without a timed sleep.
@@ -41,6 +41,7 @@ async function fixture(run, { pauseAfterVersion, pauseArchiveName = 'archive', p
       const rename = fs.rename;
       const readFile = fs.readFile;
       const writeFile = fs.writeFile;
+      const appendFile = fs.appendFile;
       let paused = false;
       const pause = async (message) => {
         paused = true;
@@ -50,6 +51,7 @@ async function fixture(run, { pauseAfterVersion, pauseArchiveName = 'archive', p
       };
       fs.readFile = async (file, ...args) => {
         const bytes = await readFile(file, ...args);
+        if (${trackArchiveReads} && String(file).includes('/versions/') && String(file).endsWith('.html')) await appendFile(${JSON.stringify(path.join(directory, 'archive-reads.log'))}, String(file) + '\\n');
         if (!paused && ${Boolean(pauseReadFile)} && file === ${JSON.stringify(path.join(sourceDir, pauseReadFile || ''))}) {
           const config = JSON.parse(await readFile(${JSON.stringify(path.join(configDir, 'config.json'))}, 'utf8'));
           if (config.archiveRoot === ${JSON.stringify(path.join(directory, pauseReadArchiveName))}) await pause('read-paused');
@@ -58,6 +60,7 @@ async function fixture(run, { pauseAfterVersion, pauseArchiveName = 'archive', p
       };
       fs.writeFile = async (file, ...args) => {
         await writeFile(file, ...args);
+        if (!paused && ${pauseRestoreWrite} && file === ${JSON.stringify(file)} && (await readFile(${JSON.stringify(file)}, 'utf8')) === ${JSON.stringify(html)}) await pause('restore-write-paused');
         if (!paused && ${pauseBeforePublication} && file.endsWith('/manifest.json.' + process.pid + '.tmp')) await pause('publication-paused');
       };
       fs.rename = async (source, destination) => {
@@ -97,7 +100,7 @@ async function fixture(run, { pauseAfterVersion, pauseArchiveName = 'archive', p
       try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break; } catch { /* Starting. */ }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    await run({ directory, sourceDir, file, html, api, get, post, history, publicationPaused, resumePublication: () => service.send('resume') });
+    await run({ directory, sourceDir, file, html, api, get, post, history, publicationPaused, archiveReads: async () => (await readFile(path.join(directory, 'archive-reads.log'), 'utf8').catch(() => '')).trim().split('\n').filter(Boolean), resumePublication: () => service.send('resume') });
   } finally {
     service.kill('SIGTERM');
     await exited;
@@ -228,6 +231,8 @@ for (const [stage, options] of [
       const response = await pending;
       assert.equal(response.status, 400);
       assert.match((await response.json()).error, /Archive settings changed/);
+      assert.deepEqual(await readdir(path.join(archived.archivePath, 'versions')).catch((error) => error.code === 'ENOENT' ? [] : Promise.reject(error)), []);
+      assert.deepEqual((await readdir(archived.archivePath).catch(() => [])).filter((name) => name.endsWith('.tmp')), []);
       await writeFile(path.join(sourceDir, 'assets/nested/icon.png'), 'edited-while-paused');
       await new Promise((resolve) => setTimeout(resolve, 1100));
       await assert.rejects(readFile(path.join(archived.archivePath, 'manifest.json')), { code: 'ENOENT' });
@@ -688,4 +693,61 @@ test('missing-source recovery keeps archive and asset paths within their folders
       await assert.rejects(readFile(file), { code: 'ENOENT' });
     }
   });
+});
+
+for (const change of ['pause', 'switch']) {
+  test(`restore finishes in its original archive when settings ${change} after source writes begin`, { timeout: 15_000 }, async () => {
+    await fixture(async ({ directory, sourceDir, file, html, api, post, history, publicationPaused, resumePublication }) => {
+      await post('/artifacts/snapshot');
+      const baseline = (await history()).versions[0];
+      await writeFile(file, '<title>New content before restore</title>');
+      await writeFile(path.join(sourceDir, 'assets/logo.png'), 'new-logo');
+      const pending = fetch(`${api}/versions/restore`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ file, versionId: baseline.id }) });
+      assert.equal((await publicationPaused)[0], 'restore-write-paused');
+      if (change === 'pause') await post('/archive/disable', {});
+      else await writeFile(path.join(directory, 'config/config.json'), JSON.stringify({ projects: [], archiveRoot: path.join(directory, 'archive-next') }));
+      resumePublication();
+      const response = await pending;
+      assert.equal(response.status, 200, JSON.stringify(await response.json()));
+      assert.equal(await readFile(file, 'utf8'), html);
+      assert.equal(await readFile(path.join(sourceDir, 'assets/logo.png'), 'utf8'), 'logo-one');
+      const archivePath = path.join(directory, 'archive', 'Lavish Library Archive', 'project');
+      const [artifactDir] = await readdir(archivePath);
+      const manifest = JSON.parse(await readFile(path.join(archivePath, artifactDir, 'manifest.json'), 'utf8'));
+      assert.deepEqual(manifest.versions.map((version) => version.reason), ['manual', 'pre-restore', 'restore']);
+      await writeFile(path.join(sourceDir, 'assets/logo.png'), 'after-restore');
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      assert.equal(JSON.parse(await readFile(path.join(archivePath, artifactDir, 'manifest.json'), 'utf8')).versions.length, 3);
+    }, { pauseRestoreWrite: true });
+  });
+}
+
+test('history avoids reading archived HTML for snapshots with stored revision metadata', async () => {
+  await fixture(async ({ file, post, history, archiveReads }) => {
+    for (let i = 0; i < 3; i += 1) {
+      await writeFile(file, `<title>Large version ${i}</title>` + 'x'.repeat(1_000_000));
+      await post('/artifacts/snapshot');
+    }
+    assert.equal((await history()).versions.length, 3);
+    await history();
+    assert.equal((await archiveReads()).length, 0);
+  }, { trackArchiveReads: true });
+});
+
+test('legacy history caches revision declarations including absent registries', async () => {
+  await fixture(async ({ post, history, archiveReads }) => {
+    await post('/artifacts/snapshot');
+    const first = await history();
+    const manifestFile = path.join(first.archivePath, 'manifest.json');
+    const manifest = JSON.parse(await readFile(manifestFile, 'utf8'));
+    delete manifest.versions[0].revisionContext;
+    await writeFile(manifestFile, JSON.stringify(manifest));
+    const before = (await archiveReads()).length;
+    assert.deepEqual((await history()).versions[0].revisionContext, []);
+    assert.deepEqual((await history()).versions[0].revisionContext, []);
+    assert.equal((await archiveReads()).length - before, 1);
+    await writeFile(path.join(first.archivePath, first.versions[0].file), '<script data-lavish-revisions>[{"id":"changed"}]</script>');
+    assert.equal((await history()).versions[0].revisionContext[0].id, 'changed');
+    assert.equal((await archiveReads()).length - before, 2);
+  }, { trackArchiveReads: true });
 });

@@ -72,7 +72,8 @@ test('synthetic browser covers backup states, accessible warnings, retry and sum
         assert(await page.eval(() => !!document.querySelector('.backup-status time[datetime]')), 'last success date missing');`);
       const saved = (await library()).artifacts[0].lastBackedUpAt;
       await blockNext();
-      await check(`${refresh}
+      await check(`await page.wait('.backup-status.failed');
+        assert((await page.eval(() => document.querySelector('.archive-stats').textContent)).includes('1 failed'), 'automatic failure summary missing');
         assert((await page.eval(() => document.querySelector('[role="alert"]').textContent)).includes('Latest content is not protected'), 'old copy implied latest protection');
         assert((await page.eval(() => document.querySelector('.backup-status time').getAttribute('datetime'))) === ${JSON.stringify(saved)}, 'last success was lost');
         assert(await page.eval(() => !document.querySelector('.history-chip.protected')), 'history chip falsely indicates protection');`);
