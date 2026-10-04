@@ -465,7 +465,7 @@ export default function Home() {
             <span className={`server-light ${library?.server.running ? 'online' : ''}`} />
             <div><strong>Lavish server</strong><span>{library?.server.running ? 'Running locally' : 'Starts when needed'}</span>{library?.server.logAvailable && <button className="reveal-log" onClick={() => void revealLog()}>Reveal server.log</button>}</div>
           </div>
-          <p>Private to this Mac</p>
+          <p>Stored on this Mac</p>
         </div>
       </aside>
 
