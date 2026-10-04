@@ -2,7 +2,7 @@ declare const __LAVISH_TRACKER_API_BASE__: string;
 
 const API_BASE = (typeof __LAVISH_TRACKER_API_BASE__ === 'string'
   ? __LAVISH_TRACKER_API_BASE__
-  : 'http://127.0.0.1:4318').replace(/\/$/, '');
+  : 'http://127.0.0.1:4318');
 
 let tokenPromise: Promise<string> | null = null;
 

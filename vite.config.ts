@@ -44,10 +44,6 @@ export default defineConfig(async () => {
 
   // Wrangler snapshots its log path while the Cloudflare plugin is imported.
   const { cloudflare } = await import('@cloudflare/vite-plugin');
-  const requestedUiPort = Number(process.env.LAVISH_TRACKER_UI_PORT || 3000);
-  const uiPort = Number.isInteger(requestedUiPort) && requestedUiPort > 0 && requestedUiPort <= 65_535
-    ? requestedUiPort
-    : 3000;
   const remoteAccess = remoteAccessConfig();
 
   return {
@@ -56,11 +52,11 @@ export default defineConfig(async () => {
     server: {
       host: remoteAccess.bindHost,
       allowedHosts: [...remoteAccess.hosts],
-      port: uiPort,
+      port: remoteAccess.uiPort,
       strictPort: true,
       ...(isCodexSeatbeltSandbox ? { watch: { useFsEvents: false, usePolling: true } } : {}),
     },
-    preview: { host: remoteAccess.bindHost, allowedHosts: [...remoteAccess.hosts], port: uiPort, strictPort: true },
+    preview: { host: remoteAccess.bindHost, allowedHosts: [...remoteAccess.hosts], port: remoteAccess.uiPort, strictPort: true },
     plugins: [
       vinext(),
       sites(),

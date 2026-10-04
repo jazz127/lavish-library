@@ -104,20 +104,20 @@ The web UI listens on localhost and its filesystem companion service listens on 
 
 ### Optional private-network access
 
-By default, both services remain limited to the local Mac. To make the UI reachable on a private network, set `LAVISH_TRACKER_BIND_HOST` to the interface address or hostname to bind and set `LAVISH_TRACKER_ALLOWED_ORIGINS` to a comma-separated list of exact browser origins. Origins must include the scheme and port when one is used; paths and wildcards are rejected. The companion accepts `Host` values derived from those origins. Set `LAVISH_TRACKER_ALLOWED_HOSTS` to a comma-separated list of explicit hostnames only when a reverse proxy uses a different `Host` value.
+By default, both services bind to loopback in development and production. To make them reachable on a trusted private network, set `LAVISH_TRACKER_BIND_HOST` to the interface address or hostname to bind and set `LAVISH_TRACKER_ALLOWED_ORIGINS` to a comma-separated list of exact browser origins. Origins must include the scheme and port when one is used; paths, wildcards, and empty lists are rejected. The companion accepts `Host` hostnames derived from those origins and the bind address. `LAVISH_TRACKER_UI_PORT` controls the UI port for both `npm run dev` and `npm start`. IPv6 bind addresses may be bracketed or unbracketed; URLs must use brackets.
 
-For example, an HTTPS reverse proxy can bind the app on a private interface, allow its public-facing origin, and send a same-origin API path to the companion:
+For example, serve the UI and companion through separate HTTPS ports on a private-network hostname:
 
 ```bash
 LAVISH_TRACKER_BIND_HOST=0.0.0.0 \
-LAVISH_TRACKER_ALLOWED_ORIGINS=https://library.example.ts.net \
-LAVISH_TRACKER_API_BASE=/companion-api \
+LAVISH_TRACKER_ALLOWED_ORIGINS=https://library.example.com \
+LAVISH_TRACKER_API_BASE=https://library.example.com:8443 \
 npm run dev
 ```
 
-Configure the proxy to serve the UI and forward `/companion-api/api/*` to the companion service's `/api/*` endpoints. If the proxy sends a `Host` value whose hostname differs from the allowed origin, add that hostname to `LAVISH_TRACKER_ALLOWED_HOSTS`. For direct access without a proxy, set `LAVISH_TRACKER_API_BASE` to the companion's reachable URL and use an origin reachable by the browser. The bind address, browser origin allowlist, host allowlist, and browser-facing API base are independent settings. `LAVISH_TRACKER_API_BASE` is compiled into the UI, so set it while running `npm run build` as well as when starting a production build.
+Configure the HTTPS front to forward the UI port to the app and its separate companion port to the filesystem service on port `4318`, preserving the hostname in `Host`. The companion's HTTPS port serves `/api/*` directly. `LAVISH_TRACKER_API_BASE` must be an absolute HTTP(S) URL reachable by the browser; relative API paths are unsupported. For direct private-network access, use the UI's exact origin and the companion's reachable URL. `LAVISH_TRACKER_API_BASE` is compiled into the UI, so set it while running `npm run build`. Supply the bind host, allowed origins, and UI port when starting a production build.
 
-Binding to a non-loopback address without an explicit origin allowlist is refused at startup. Keep the app on a trusted private network and use HTTPS through a trusted proxy when credentials or library data cross the network. The per-start companion authorization token remains required for browser API calls, and artifact operations remain limited to files found by the bounded library scan.
+Binding to a non-loopback address without an explicit origin allowlist is refused at startup. Private-network reachability and the explicit origin allowlist are the trust boundary: there are no accounts or identity authentication. Any peer that can reach the companion and supply an allowed origin can obtain a token and read or modify the owner's discovered library, including restoring archived files. Use private-network access controls to limit reachable peers and HTTPS to protect data in transit. Non-allowlisted origins are rejected. In remote mode, every API read and mutation requires the per-start token even without browser headers; session bootstrap requires an allowed origin, and CORS preflight does not require a token. Local command-line access over loopback remains available without browser headers. Artifact operations remain limited to files found by the bounded library scan.
 
 ## License
 
@@ -129,6 +129,4 @@ Run `npm test`, `npm run lint`, `npm run typecheck`, and `npm run build`. Sessio
 
 Run `npm run test:backup-ui` with `chrome-devtools-axi` installed to exercise backup warnings, keyboard retry, last-success dates, and summary recovery in an isolated browser against synthetic data. This opt-in check does not use an installed Lavish library. Set `LAVISH_BACKUP_SCREENSHOT_DIR` to a local output folder to capture desktop and mobile warning layouts.
 
-CI uses the dedicated `ji7-lavish-library` runner on JI7 for main pushes and same-repository pull requests. Fork pull requests use GitHub-hosted Ubuntu runners. The repository Actions setting requires approval for **all external contributors**. The self-hosted job also checks the PR head repository before scheduling. Keep both protections in place; reviewing a fork workflow must include checking any changes to runner selection. Release Please stays on GitHub-hosted Ubuntu because it needs only GitHub API/token access.
-
-The JI7 runner runs as the `fm-manage` user service `actions-runner-ji7-lavish-library.service`, with labels `self-hosted`, `Linux`, `X64`, `ji7`, and `lavish-library`. Its installation is `/home/fm-manage/actions-runners/ji7-lavish-library`; its work directory is `_work`. It follows the existing user-systemd runner setup and is enabled at startup.
+CI runs tests, lint, type checks, and the production build on GitHub-hosted Ubuntu runners for main pushes and pull requests. Release Please also uses a GitHub-hosted runner.

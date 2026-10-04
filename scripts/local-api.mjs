@@ -7,10 +7,10 @@ import os from 'node:os';
 import path from 'node:path';
 import { createPreviewCache } from './artifact-previews.mjs';
 import { artifactFailures, revisionContext, revealServerLog, serverLogPath } from './review-diagnostics.mjs';
-import { allowedHost, remoteAccessConfig } from './remote-access.mjs';
+import { allowedHost, hostAuthority, isLoopbackHost, remoteAccessConfig } from './remote-access.mjs';
 
-const PORT = Number(process.env.LAVISH_TRACKER_API_PORT || 4318);
 const remoteAccess = remoteAccessConfig();
+const PORT = remoteAccess.apiPort;
 const HOST = remoteAccess.bindHost;
 const STATE_FILE = process.env.LAVISH_AXI_STATE_DIR
   ? path.join(process.env.LAVISH_AXI_STATE_DIR, 'state.json')
@@ -1184,12 +1184,12 @@ const server = createServer(async (req, res) => {
     return res.end();
   }
   try {
-    const url = new URL(req.url, `http://${HOST}:${PORT}`);
+    const url = new URL(req.url, `http://${hostAuthority(HOST)}:${PORT}`);
     if (req.method === 'GET' && url.pathname === '/api/session') {
       if (!origin) return json(res, 403, { error: 'Open Lavish Library in its local browser page first.' });
       return json(res, 200, { token: API_TOKEN }, origin);
     }
-    if (origin && url.pathname.startsWith('/api/') && !tokenAllowed(req.headers['x-lavish-token'])) {
+    if ((origin || !remoteAccess.isLoopback || !isLoopbackHost(req.socket.remoteAddress)) && url.pathname.startsWith('/api/') && !tokenAllowed(req.headers['x-lavish-token'])) {
       return json(res, 401, { error: 'The local browser session is not authorized.' }, origin);
     }
     if (req.method === 'GET' && url.pathname === '/api/library') return json(res, 200, await buildLibrary(), origin);
@@ -1345,4 +1345,4 @@ const server = createServer(async (req, res) => {
 
 const periodicScan = setInterval(() => buildLibrary().catch(() => {}), 30_000);
 periodicScan.unref();
-server.listen(PORT, HOST, () => console.log(`Lavish Tracker library service: http://${HOST}:${PORT}`));
+server.listen(PORT, HOST, () => console.log(`Lavish Tracker library service: http://${hostAuthority(HOST)}:${PORT}`));
