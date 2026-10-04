@@ -6,6 +6,7 @@ import { connect } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { freePort } from './helpers/backup-fixture.mjs';
 
 const root = process.cwd();
 const configuredPort = 46_000 + (process.pid % 1_000);
@@ -91,9 +92,10 @@ async function startupFixture(t, settings, host, port, { mode = 'start', envFile
   throw new Error(`App UI did not start: ${output}`);
 }
 
-test('npm start binds only loopback on the default UI port', { skip: networkUnavailable }, async (t) => {
-  await startupFixture(t, {}, '127.0.0.1', 3000);
-  assert.equal(await canConnect(networkHost, 3000), false);
+test('npm start binds only loopback on an available UI port', { skip: networkUnavailable }, async (t) => {
+  const port = await freePort();
+  await startupFixture(t, { LAVISH_TRACKER_UI_PORT: String(port) }, '127.0.0.1', port);
+  assert.equal(await canConnect(networkHost, port), false);
 });
 
 test('npm start honors an opted-in bind host and configured UI port', { skip: networkUnavailable }, async (t) => {
