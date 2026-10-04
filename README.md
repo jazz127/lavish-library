@@ -43,6 +43,14 @@ Releases follow semantic versioning. Conventional `fix:`, `feat:`, and breaking-
 
 See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
+### Release workflow
+
+Open feature and fix pull requests against `dev`. Use conventional commit messages (`feat:`, `fix:`, or breaking-change markers); if squashing a feature PR into `dev`, give its squash commit a conventional message.
+
+To release, open a pull request from `dev` to `main` and choose **Create a merge commit**. This preserves the individual conventional commits so Release Please can collect their changelog entries since the last release. Do not squash the `dev` → `main` pull request: that replaces the batch with one commit and loses the individual entries unless they are explicitly reconstructed in its message.
+
+The push to `main` runs Release Please, which is explicitly pinned to `main` even when `dev` is the default branch. Review and merge its version-and-changelog pull request on `main` to create the GitHub Release and tag. Then merge `main` back into `dev` with a merge commit to carry the updated versions, release manifest, and changelog into ongoing development.
+
 ## Version archive
 
 Choose **Set up archive** in the app and select any local or synced folder. The app creates a readable `Lavish Library Archive` beneath it, grouped by project and artifact. Each version has its own HTML file, local assets, a complete bundle checksum, timestamps, and manifest entry. Identity includes the HTML bytes and the paths, bytes, and availability of its bounded local dependencies, so CSS and image edits create versions even when HTML is unchanged.
