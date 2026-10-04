@@ -55,10 +55,11 @@ async function readJson(file, fallback) {
   try { return JSON.parse(await readFile(file, 'utf8')); } catch { return fallback; }
 }
 
-async function writeJson(file, value) {
+async function writeJson(file, value, beforePublish) {
   await mkdir(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.tmp`;
   await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  if (beforePublish) await beforePublish();
   await rename(temporary, file);
 }
 
@@ -73,6 +74,12 @@ async function readConfig() {
 async function saveConfig(config) {
   await mkdir(CONFIG_DIR, { recursive: true });
   await writeJson(CONFIG_FILE, config);
+}
+
+async function requireActiveArchive(config) {
+  if ((await readConfig()).archiveRoot !== config.archiveRoot) {
+    throw new Error('Archive settings changed. Refresh the library and try again.');
+  }
 }
 
 function analyticsDefaults() {
@@ -442,14 +449,19 @@ async function readManifest(config, artifact) {
 }
 
 async function snapshotArtifactNow(config, artifact, reason = 'scan', supplementalAssets = []) {
-  if (!config.archiveRoot || !artifact.exists) return null;
+  if (!config.archiveRoot) return null;
+  await requireActiveArchive(config);
+  if (!artifact.exists) return null;
   const collected = await collectBundle(artifact.file, supplementalAssets);
   const { html, bundle, bundleSha256, watchDirs } = collected;
-  refreshArtifactWatchers(config, artifact, watchDirs);
   const contentSha = sha256(collected.htmlBytes);
   const manifest = await readManifest(config, artifact);
   const latest = manifest.versions.at(-1);
-  if (latest && await archivedBundleSha(config, artifact, latest).catch(() => null) === bundleSha256) return { manifest };
+  if (latest && await archivedBundleSha(config, artifact, latest).catch(() => null) === bundleSha256) {
+    await requireActiveArchive(config);
+    refreshArtifactWatchers(config, artifact, watchDirs);
+    return { manifest };
+  }
 
   const sourceStat = await stat(artifact.file);
   const createdAt = new Date().toISOString();
@@ -486,7 +498,10 @@ async function snapshotArtifactNow(config, artifact, reason = 'scan', supplement
     reason,
     file: path.relative(artifactArchiveDir(config, artifact), archivedFile),
   });
-  await writeJson(manifestPath(config, artifact), manifest);
+  await writeJson(manifestPath(config, artifact), manifest, async () => {
+    await requireActiveArchive(config);
+    refreshArtifactWatchers(config, artifact, watchDirs);
+  });
   return { manifest };
 }
 
@@ -553,7 +568,8 @@ function refreshArtifactWatchers(config, artifact, watchDirs) {
   }
 }
 
-function syncArtifactWatchers(config, artifacts) {
+async function syncArtifactWatchers(config, artifacts) {
+  if ((await readConfig()).archiveRoot !== config.archiveRoot) return;
   if (!config.archiveRoot) return closeArtifactWatchers();
   const targets = new Set(artifacts.filter((artifact) => artifact.exists).map((artifact) => artifact.file));
   for (const [file, entry] of artifactWatchers) {
@@ -633,7 +649,7 @@ async function buildLibrary() {
       if (latestProtected && artifact.versionCount > 0) protectedArtifacts += 1;
     }
   }
-  syncArtifactWatchers(config, artifacts);
+  await syncArtifactWatchers(config, artifacts);
   for (const artifact of artifacts) if (artifact.exists) previews.schedule(artifact);
 
   const projects = [...projectMap.values(), ...(hasLoose ? [looseProject] : [])].map((project) => ({
