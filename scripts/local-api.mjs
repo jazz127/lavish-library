@@ -445,17 +445,11 @@ async function snapshotArtifactNow(config, artifact, reason = 'scan', supplement
   if (!config.archiveRoot || !artifact.exists) return null;
   const collected = await collectBundle(artifact.file, supplementalAssets);
   const { html, bundle, bundleSha256, watchDirs } = collected;
-  // Arm newly discovered dependency directories before publishing this version.
-  // A history reader can edit them as soon as the manifest rename is visible,
-  // even before that rename's completion resumes this snapshot operation.
-  const watcher = artifactWatchers.get(artifact.file);
-  if (watcher?.archiveRoot === config.archiveRoot) {
-    refreshArtifactWatchers(config, artifact, watcher, watchDirs);
-  }
+  refreshArtifactWatchers(config, artifact, watchDirs);
   const contentSha = sha256(collected.htmlBytes);
   const manifest = await readManifest(config, artifact);
   const latest = manifest.versions.at(-1);
-  if (latest && await archivedBundleSha(config, artifact, latest).catch(() => null) === bundleSha256) return { manifest, watchDirs };
+  if (latest && await archivedBundleSha(config, artifact, latest).catch(() => null) === bundleSha256) return { manifest };
 
   const sourceStat = await stat(artifact.file);
   const createdAt = new Date().toISOString();
@@ -493,7 +487,7 @@ async function snapshotArtifactNow(config, artifact, reason = 'scan', supplement
     file: path.relative(artifactArchiveDir(config, artifact), archivedFile),
   });
   await writeJson(manifestPath(config, artifact), manifest);
-  return { manifest, watchDirs };
+  return { manifest };
 }
 
 function queueArtifactOperation(artifact, operation) {
@@ -518,8 +512,17 @@ function closeArtifactWatchers() {
   artifactWatchers.clear();
 }
 
-function refreshArtifactWatchers(config, artifact, entry, watchDirs) {
-  if (artifactWatchers.get(artifact.file) !== entry) return;
+function refreshArtifactWatchers(config, artifact, watchDirs) {
+  let entry = artifactWatchers.get(artifact.file);
+  if (entry && entry.archiveRoot !== config.archiveRoot) {
+    closeWatcherEntry(entry);
+    artifactWatchers.delete(artifact.file);
+    entry = null;
+  }
+  if (!entry) {
+    entry = { watchers: new Map(), timer: null, archiveRoot: config.archiveRoot };
+    artifactWatchers.set(artifact.file, entry);
+  }
   for (const [directory, watcher] of entry.watchers) {
     if (!watchDirs.has(directory)) {
       watcher.close();
@@ -550,7 +553,7 @@ function refreshArtifactWatchers(config, artifact, entry, watchDirs) {
   }
 }
 
-function syncArtifactWatchers(config, artifacts, watchDirsByFile) {
+function syncArtifactWatchers(config, artifacts) {
   if (!config.archiveRoot) return closeArtifactWatchers();
   const targets = new Set(artifacts.filter((artifact) => artifact.exists).map((artifact) => artifact.file));
   for (const [file, entry] of artifactWatchers) {
@@ -558,16 +561,6 @@ function syncArtifactWatchers(config, artifacts, watchDirsByFile) {
       closeWatcherEntry(entry);
       artifactWatchers.delete(file);
     }
-  }
-  for (const artifact of artifacts) {
-    if (!artifact.exists) continue;
-    let entry = artifactWatchers.get(artifact.file);
-    if (!entry) {
-      entry = { watchers: new Map(), timer: null, archiveRoot: config.archiveRoot };
-      artifactWatchers.set(artifact.file, entry);
-    }
-    const watchDirs = watchDirsByFile.get(artifact.file);
-    if (watchDirs) refreshArtifactWatchers(config, artifact, entry, watchDirs);
   }
 }
 
@@ -619,7 +612,6 @@ async function buildLibrary() {
   let totalVersions = 0;
   let protectedArtifacts = 0;
   let failedArtifacts = 0;
-  const watchDirsByFile = new Map();
   if (config.archiveRoot) {
     for (const artifact of artifacts) {
       let manifest;
@@ -627,7 +619,6 @@ async function buildLibrary() {
       try {
         const snapshot = artifact.exists ? await snapshotArtifact(config, artifact, 'scan') : null;
         manifest = snapshot?.manifest || await readManifest(config, artifact);
-        if (snapshot) watchDirsByFile.set(artifact.file, snapshot.watchDirs);
         latestProtected = Boolean(snapshot);
       } catch (error) {
         artifact.backupError = error instanceof Error ? error.message : 'Backup failed';
@@ -642,7 +633,7 @@ async function buildLibrary() {
       if (latestProtected && artifact.versionCount > 0) protectedArtifacts += 1;
     }
   }
-  syncArtifactWatchers(config, artifacts, watchDirsByFile);
+  syncArtifactWatchers(config, artifacts);
   for (const artifact of artifacts) if (artifact.exists) previews.schedule(artifact);
 
   const projects = [...projectMap.values(), ...(hasLoose ? [looseProject] : [])].map((project) => ({
@@ -839,19 +830,8 @@ async function restoreVersion(file, versionId) {
       }
     }
     artifact.exists = true;
-    const snapshot = await snapshotArtifactNow(config, artifact, 'restore', version.supplementalAssets || []);
+    await snapshotArtifactNow(config, artifact, 'restore', version.supplementalAssets || []);
     knownArtifactsCache = { key: '', at: 0, value: null, pending: null };
-    let watcher = artifactWatchers.get(artifact.file);
-    if (watcher && watcher.archiveRoot !== config.archiveRoot) {
-      closeWatcherEntry(watcher);
-      artifactWatchers.delete(artifact.file);
-      watcher = null;
-    }
-    if (!watcher) {
-      watcher = { watchers: new Map(), timer: null, archiveRoot: config.archiveRoot };
-      artifactWatchers.set(artifact.file, watcher);
-    }
-    refreshArtifactWatchers(config, artifact, watcher, snapshot.watchDirs);
     return resolved;
   });
 }

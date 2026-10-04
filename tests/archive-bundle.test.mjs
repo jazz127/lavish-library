@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
-async function fixture(run, { pauseAfterVersion } = {}) {
+async function fixture(run, { pauseAfterVersion, pauseArchiveName = 'archive', pauseReason } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'lavish-bundle-'));
   const sourceDir = path.join(directory, 'project', '.lavish');
   const stateDir = path.join(directory, 'state');
@@ -38,11 +38,14 @@ async function fixture(run, { pauseAfterVersion } = {}) {
       import { once } from 'node:events';
       import { syncBuiltinESMExports } from 'node:module';
       const rename = fs.rename;
+      let paused = false;
       fs.rename = async (source, destination) => {
         await rename(source, destination);
-        if (!destination.endsWith('/manifest.json')) return;
+        if (paused || !destination.endsWith('/manifest.json') || !destination.startsWith(${JSON.stringify(path.join(directory, pauseArchiveName) + path.sep)})) return;
         const manifest = JSON.parse(await fs.readFile(destination, 'utf8'));
         if (manifest.versions.length !== ${pauseAfterVersion}) return;
+        if (${JSON.stringify(pauseReason || '')} && manifest.versions.at(-1).reason !== ${JSON.stringify(pauseReason || '')}) return;
+        paused = true;
         const resumed = once(process, 'message');
         process.send('manifest-published');
         await resumed;
@@ -95,7 +98,7 @@ async function waitForVersion(history, count) {
 
 test('reconciliation archives asset-only edits and current compares the complete bundle', async () => {
   await fixture(async ({ sourceDir, get, post, history }) => {
-    await post('/artifacts/snapshot'); // No watcher installed: reconciliation must catch the edit.
+    await post('/artifacts/snapshot');
     const baseline = (await history()).versions[0];
     await writeFile(path.join(sourceDir, 'assets/logo.png'), 'logo-two');
     assert.equal((await history()).versions.some((version) => version.isCurrent), false);
@@ -108,6 +111,87 @@ test('reconciliation archives asset-only edits and current compares the complete
     assert.equal(result.versions[1].isCurrent, false);
     await get('/library');
     assert.equal((await history()).versions.length, 2);
+  });
+});
+
+async function editPublishedDependency(context, publication, versionCount) {
+  const { sourceDir, history, publicationPaused, resumePublication } = context;
+  assert.equal((await publicationPaused)[0], 'manifest-published');
+  const published = await history();
+  assert.equal(published.versions.length, versionCount);
+  const icon = path.join(sourceDir, 'assets/nested/icon.png');
+  await writeFile(icon, 'edited-after-publication');
+  resumePublication();
+  await publication;
+  const changed = await waitForVersion(history, versionCount + 1);
+  assert.equal(changed.versions[0].reason, 'change');
+  assert.equal(changed.versions[0].isCurrent, true);
+  assert.equal(await readFile(path.join(changed.archivePath, path.dirname(changed.versions[0].file), 'assets/nested/icon.png'), 'utf8'), 'edited-after-publication');
+  assert.equal(await readFile(path.join(published.archivePath, path.dirname(published.versions[0].file), 'assets/nested/icon.png'), 'utf8'), 'icon-one');
+  return changed;
+}
+
+test('manual snapshot watches dependencies before its first manifest is published', { timeout: 15_000 }, async () => {
+  await fixture(async (context) => {
+    await editPublishedDependency(context, context.post('/artifacts/snapshot'), 1);
+  }, { pauseAfterVersion: 1 });
+});
+
+test('initial archive setup watches each artifact before its baseline is published', { timeout: 15_000 }, async () => {
+  await fixture(async (context) => {
+    const { directory, sourceDir, file, get } = context;
+    const configFile = path.join(directory, 'config/config.json');
+    await writeFile(configFile, JSON.stringify({ projects: [], archiveRoot: null }));
+    const secondFile = path.join(sourceDir, 'other/second.html');
+    await mkdir(path.dirname(secondFile));
+    await writeFile(secondFile, '<title>Second artifact</title>');
+    await writeFile(path.join(directory, 'state/state.json'), JSON.stringify({ sessions: { demo: { file }, second: { file: secondFile } } }));
+    assert.equal((await get('/library')).artifacts.length, 2);
+    await writeFile(configFile, JSON.stringify({ projects: [], archiveRoot: path.join(directory, 'archive') }));
+    await editPublishedDependency(context, get('/library'), 1);
+    await writeFile(secondFile, '<title>Second artifact edited</title>');
+    const secondHistory = () => get(`/artifacts/versions?file=${encodeURIComponent(secondFile)}`);
+    const secondChanged = await waitForVersion(secondHistory, 2);
+    assert.equal(secondChanged.versions[0].reason, 'change');
+    assert.equal(await readFile(path.join(secondChanged.archivePath, secondChanged.versions[0].file), 'utf8'), '<title>Second artifact edited</title>');
+  }, { pauseAfterVersion: 1 });
+});
+
+test('archive switches replace dependency watchers before publishing the new baseline', { timeout: 15_000 }, async () => {
+  await fixture(async (context) => {
+    const { directory, get } = context;
+    await get('/library');
+    const nextArchive = path.join(directory, 'archive-next');
+    await writeFile(path.join(directory, 'config/config.json'), JSON.stringify({ projects: [], archiveRoot: nextArchive }));
+    const changed = await editPublishedDependency(context, get('/library'), 1);
+    assert.equal(changed.archivePath.startsWith(nextArchive + path.sep), true);
+  }, { pauseAfterVersion: 1, pauseArchiveName: 'archive-next' });
+});
+
+test('missing-source restore watches recreated dependencies before publishing its version', { timeout: 15_000 }, async () => {
+  await fixture(async (context) => {
+    const { file, post, get, history } = context;
+    await post('/artifacts/snapshot');
+    const baseline = (await history()).versions[0];
+    await writeFile(file, '<title>Newer document</title>');
+    await post('/artifacts/snapshot');
+    await rm(file);
+    await get('/library');
+    await editPublishedDependency(context, post('/versions/restore', { file, versionId: baseline.id }), 3);
+  }, { pauseAfterVersion: 3, pauseReason: 'restore' });
+});
+
+test('deduplicated snapshots rearm dependency watchers after archive is re-enabled', async () => {
+  await fixture(async ({ directory, sourceDir, post, history }) => {
+    await post('/artifacts/snapshot');
+    await post('/archive/disable', {});
+    await writeFile(path.join(directory, 'config/config.json'), JSON.stringify({ projects: [], archiveRoot: path.join(directory, 'archive') }));
+    await post('/artifacts/snapshot');
+    assert.equal((await history()).versions.length, 1);
+    await writeFile(path.join(sourceDir, 'assets/nested/icon.png'), 'changed-after-rearming');
+    const changed = await waitForVersion(history, 2);
+    assert.equal(changed.versions[0].reason, 'change');
+    assert.equal(await readFile(path.join(changed.archivePath, path.dirname(changed.versions[0].file), 'assets/nested/icon.png'), 'utf8'), 'changed-after-rearming');
   });
 });
 
