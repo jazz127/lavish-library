@@ -179,14 +179,9 @@ export default function Home() {
     };
     void refresh();
     const timer = window.setInterval(() => void refresh(), 5000);
-    const resume = () => void refresh();
-    window.addEventListener('focus', resume);
-    document.addEventListener('visibilitychange', resume);
     return () => {
       controller.abort();
       window.clearInterval(timer);
-      window.removeEventListener('focus', resume);
-      document.removeEventListener('visibilitychange', resume);
     };
   }, []);
 
