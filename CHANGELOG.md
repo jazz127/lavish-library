@@ -2,6 +2,21 @@
 
 Notable changes to Lavish Library are recorded here. Releases follow [Semantic Versioning](https://semver.org/).
 
+## [0.4.0](https://github.com/jazz127/lavish-library/compare/v0.3.1...v0.4.0) (2026-10-02)
+
+
+### Features
+
+* show real artifact thumbnails in library cards ([#26](https://github.com/jazz127/lavish-library/issues/26)) ([66d9d5b](https://github.com/jazz127/lavish-library/commit/66d9d5bd3e18914857f09ecdf1fbacb4248ca354))
+
+
+### Bug Fixes
+
+* align Lavish tracking with upstream and harden local launches ([#18](https://github.com/jazz127/lavish-library/issues/18)) ([24c0291](https://github.com/jazz127/lavish-library/commit/24c029113c3b502a45cf49882560edb8c277e486))
+* keep releases on main after dev switch ([#28](https://github.com/jazz127/lavish-library/issues/28)) ([8d96ddc](https://github.com/jazz127/lavish-library/commit/8d96ddc0d9683c6783d6626d2cd16d1d58f2e750))
+* recover missing sources from archive ([#21](https://github.com/jazz127/lavish-library/issues/21)) ([10659b9](https://github.com/jazz127/lavish-library/commit/10659b94d0466c9116d1de45f1159e7c77f23f04)), closes [#14](https://github.com/jazz127/lavish-library/issues/14)
+* version archive snapshots by complete asset bundle ([#20](https://github.com/jazz127/lavish-library/issues/20)) ([2f49511](https://github.com/jazz127/lavish-library/commit/2f4951178adeb23d960aae324c289706e4def0a5))
+
 ## [0.3.1](https://github.com/jazz127/lavish-library/compare/v0.3.0...v0.3.1) (2026-09-01)
 
 
