@@ -128,7 +128,7 @@ export default function Home() {
   const [view, setView] = useState<'grid' | 'list'>('grid');
   const [section, setSection] = useState<PageSection>('library');
   const [loading, setLoading] = useState(true);
-  const [notice, setNotice] = useState<string | { source: 'library' | 'history'; message: string }>('');
+  const [notice, setNotice] = useState<string | { source: 'library' | 'history' | 'manual-folder' | 'archive-pause'; message: string }>('');
   const noticeMessage = typeof notice === 'string' ? notice : notice.message;
   const [manualPath, setManualPath] = useState('');
   const [showAdd, setShowAdd] = useState(false);
@@ -320,9 +320,10 @@ export default function Home() {
       if (!response.ok) throw new Error(result.error || 'Could not add that folder.');
       setManualPath('');
       setShowAdd(false);
+      setNotice((current) => typeof current !== 'string' && current.source === 'manual-folder' ? '' : current);
       await loadLibrary(true);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'Could not add that folder.');
+      setNotice({ source: 'manual-folder', message: error instanceof Error ? error.message : 'Could not add that folder.' });
     }
   }
 
@@ -390,9 +391,10 @@ export default function Home() {
       const response = await apiFetch('/archive/disable', { method: 'POST' });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || 'Could not pause backups.');
+      setNotice((current) => typeof current !== 'string' && current.source === 'archive-pause' ? '' : current);
       await loadLibrary(true);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'Could not pause backups.');
+      setNotice({ source: 'archive-pause', message: error instanceof Error ? error.message : 'Could not pause backups.' });
     }
   }
 

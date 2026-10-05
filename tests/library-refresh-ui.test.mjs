@@ -11,17 +11,18 @@ test('synthetic library refresh regressions', { skip: process.env.LAVISH_BACKUP_
     bundle: true, write: false, jsx: 'automatic',
   });
   const bootstrap = `
-    window.fixture = { requests: [], snapshots: 0, hidden: location.search === '?hidden', poll: null };
+    window.fixture = { requests: [], actions: [], snapshots: 0, hidden: location.search === '?hidden', poll: null };
     Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => fixture.hidden ? 'hidden' : 'visible' });
     const originalInterval = window.setInterval;
     window.setInterval = (callback, delay, ...args) => {
       if (delay === 5000) { fixture.poll = callback; return 0; }
       return originalInterval(callback, delay, ...args);
     };
-    window.fetch = async (url) => {
+    window.fetch = async (url, init) => {
       const route = new URL(url).pathname;
       if (route === '/api/session') return Response.json({ token: 'synthetic' });
       if (route === '/api/library') return new Promise((resolve) => fixture.requests.push({ complete: (value, status = 200) => resolve(Response.json(value, { status })) }));
+      if (route === '/api/projects' || route === '/api/archive/disable') return new Promise((resolve) => fixture.actions.push({ route, body: init?.body, complete: (value, status = 200) => resolve(Response.json(value, { status })) }));
       if (route === '/api/artifacts/snapshot') { fixture.snapshots += 1; return Response.json({}); }
       return Response.json({ status: 'unavailable' });
     };
@@ -145,6 +146,68 @@ test('synthetic library refresh regressions', { skip: process.env.LAVISH_BACKUP_
         await wait(() => document.querySelector('.description')?.textContent === 'Changed archive folder' && !document.querySelector('.notice'));
       `);
     });
+    for (const manualFolder of [true, false]) {
+      for (const outcome of ['resolved', 'unrelated', 'library-failure']) {
+        await t.test(`${manualFolder ? 'manual folder addition' : 'archive pause'} retry clears its own error (${outcome})`, async () => {
+          await check(`
+            await page.open('${url}');
+            await wait(() => window.fixture.requests.length === 1);
+            await page.eval(() => fixture.requests[0].complete(libraryValue(true)));
+            await wait(() => !!document.querySelector('.artifact-card'));
+            await page.eval(() => document.querySelector('${manualFolder ? '.add-button' : '.archive-button'}').click());
+            await wait(() => !!document.querySelector('${manualFolder ? '.add-panel form' : '.quiet-danger'}'));
+            ${manualFolder ? `
+              await page.eval(() => {
+                const input = document.querySelector('.add-panel input');
+                Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '/missing');
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+              });
+            ` : `
+              await page.eval(() => { window.confirm = () => false; document.querySelector('.quiet-danger').click(); });
+              await page.eval(() => new Promise((resolve) => setTimeout(resolve, 50)));
+              assert(await page.eval(() => fixture.actions.length === 0 && !document.querySelector('.notice')), 'cancelled pause started an action');
+              await page.eval(() => { window.confirm = () => true; });
+            `}
+            await page.eval(() => document.querySelector('${manualFolder ? '.add-panel form button' : '.quiet-danger'}').click());
+            await wait(() => window.fixture.actions.length === 1);
+            assert(await page.eval(() => fixture.actions[0].route === '${manualFolder ? '/api/projects' : '/api/archive/disable'}'${manualFolder ? " && JSON.parse(fixture.actions[0].body).path === '/missing'" : ''}), 'wrong action or input submitted');
+            await page.eval(() => fixture.actions[0].complete({ error: '${manualFolder ? 'Choose an existing folder.' : 'Could not pause backups.'}' }, 400));
+            await wait(() => document.querySelector('.notice')?.textContent === '${manualFolder ? 'Choose an existing folder.' : 'Could not pause backups.'}');
+            assert(await page.eval(() => fixture.requests.length === 1), 'failed action refreshed the library');
+            ${manualFolder ? `
+              await page.eval(() => {
+                const input = document.querySelector('.add-panel input');
+                Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '/synthetic/project');
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+              });
+            ` : ''}
+            await page.eval(() => document.querySelector('${manualFolder ? '.add-panel form button' : '.quiet-danger'}').click());
+            await wait(() => window.fixture.actions.length === 2);
+            ${manualFolder ? "assert(await page.eval(() => JSON.parse(fixture.actions[1].body).path === '/synthetic/project'), 'corrected path not submitted');" : ''}
+            ${outcome === 'unrelated' ? `
+              await page.eval(() => document.querySelector('.reveal-log').click());
+              await wait(() => document.querySelector('.notice')?.textContent === 'Revealed server.log in Finder.');
+            ` : ''}
+            await page.eval(() => fixture.actions[1].complete({}));
+            await wait(() => window.fixture.requests.length === 2);
+            await wait(() => ${outcome === 'unrelated' ? "document.querySelector('.notice')?.textContent === 'Revealed server.log in Finder.'" : "!document.querySelector('.notice')"});
+            ${outcome === 'library-failure' ? `
+              await page.eval(() => fixture.requests[1].complete({}, 503));
+              await wait(() => document.querySelector('.notice')?.textContent === 'The local library service did not respond.');
+            ` : `
+              await page.eval(() => {
+                const value = libraryValue(true, 'Successful action reconciliation');
+                ${manualFolder ? "value.projects[0].path = '/synthetic/project';" : 'value.archive.enabled = false;'}
+                fixture.requests[1].complete(value);
+              });
+              await wait(() => document.querySelector('.description')?.textContent === 'Successful action reconciliation');
+              assert(await page.eval(() => ${outcome === 'unrelated' ? "document.querySelector('.notice')?.textContent === 'Revealed server.log in Finder.'" : "!document.querySelector('.notice')"}), 'retry cleared an unrelated notice or retained its resolved error');
+              assert(await page.eval(() => ${manualFolder ? "!document.querySelector('.add-panel')" : "document.querySelector('.backup-status')?.textContent.includes('Archive disabled') && !document.querySelector('.quiet-danger')"}), 'successful action did not update the UI');
+            `}
+          `);
+        });
+      }
+    }
     await t.test('hidden initial load resumes on visibility and keeps polling', async () => {
       await check(`
         await page.open('${url}?hidden');
