@@ -2,6 +2,21 @@
 
 Notable changes to Lavish Library are recorded here. Releases follow [Semantic Versioning](https://semver.org/).
 
+## [0.5.0](https://github.com/jazz127/lavish-library/compare/v0.4.0...v0.5.0) (2026-10-05)
+
+
+### Features
+
+* add private-network library access and fix archive watcher races ([#34](https://github.com/jazz127/lavish-library/issues/34)) ([68f7874](https://github.com/jazz127/lavish-library/commit/68f78741641935a68e14a8f3e9af3201440d9d16))
+
+
+### Bug Fixes
+
+* **app:** resolve overlapping refreshes and background-tab loading ([5233260](https://github.com/jazz127/lavish-library/commit/523326074076cd126b789f98b94c2e2b755c680d))
+* reconcile backups and refresh visible tabs ([7e9a831](https://github.com/jazz127/lavish-library/commit/7e9a831a5dd419f12af3d7ab35565c9324267f8c))
+* refresh backup status and harden archive history ([d8dc545](https://github.com/jazz127/lavish-library/commit/d8dc545bc52bed95f03f1af47073f6916826166c))
+* refresh backup status and harden archives ([ac38378](https://github.com/jazz127/lavish-library/commit/ac38378a7adc55e7297ebd295c492ab7bed128e7))
+
 ## [0.4.0](https://github.com/jazz127/lavish-library/compare/v0.3.1...v0.4.0) (2026-10-02)
 
 
