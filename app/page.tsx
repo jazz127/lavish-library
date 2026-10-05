@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import InsightsView from './insights-view';
 import ArtifactPreview from './artifact-preview';
 import BackupStatus, { isLatestProtected } from './backup-status';
@@ -139,29 +139,38 @@ export default function Home() {
   const [backingUp, setBackingUp] = useState<string[]>([]);
   const searchRef = useRef<HTMLInputElement>(null);
   const trackedSearchRef = useRef('');
-  const libraryRequestRef = useRef(0);
+  const libraryRequestRef = useRef<Promise<Library | undefined> | null>(null);
   const historyRefreshRef = useRef<(() => Promise<void>) | null>(null);
   const historyFile = historyArtifact?.file;
 
-  async function loadLibrary(quiet = false) {
-    const request = ++libraryRequestRef.current;
+  const loadLibrary = useCallback(async (quiet = false, signal?: AbortSignal): Promise<Library | undefined> => {
     if (!quiet) setLoading(true);
-    try {
-      const response = await apiFetch('/library', { cache: 'no-store' });
-      if (!response.ok) throw new Error('The local library service did not respond.');
-      const value: Library = await response.json();
-      if (request === libraryRequestRef.current) {
-        setLibrary(value);
-        setNotice('');
+    const request: Promise<Library | undefined> = (async () => {
+      try {
+        const response = await apiFetch('/library', { cache: 'no-store', signal });
+        if (!response.ok) throw new Error('The local library service did not respond.');
+        const value: Library = await response.json();
+        if (!signal?.aborted && request === libraryRequestRef.current) {
+          setLibrary(value);
+          setNotice((current) => typeof current !== 'string' && current.source === 'library' ? '' : current);
+        }
+        return value;
+      } catch (error) {
+        if (!signal?.aborted && request === libraryRequestRef.current) {
+          setNotice({ source: 'library', message: error instanceof Error ? error.message : 'Could not load your library.' });
+        }
+      } finally {
+        if (!signal?.aborted && request === libraryRequestRef.current) setLoading(false);
       }
-      // Action callers still need their result when a newer poll owns state.
-      return value;
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'Could not load your library.');
-    } finally {
-      setLoading(false);
+    })();
+    libraryRequestRef.current = request;
+    let latest = request;
+    for (;;) {
+      const value = await latest;
+      if (latest === libraryRequestRef.current) return value;
+      latest = libraryRequestRef.current!;
     }
-  }
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -170,20 +179,10 @@ export default function Home() {
       if (pending || document.visibilityState === 'hidden') return;
       document.removeEventListener('visibilitychange', refresh);
       pending = true;
-      const request = ++libraryRequestRef.current;
       try {
-        const response = await apiFetch('/library', { cache: 'no-store', signal: controller.signal });
-        if (!response.ok) throw new Error('The local library service did not respond.');
-        const value: Library = await response.json();
-        if (!controller.signal.aborted && request === libraryRequestRef.current) {
-          setLibrary(value);
-          setNotice((current) => typeof current !== 'string' && current.source === 'library' ? '' : current);
-        }
-      } catch (error) {
-        if (!controller.signal.aborted && request === libraryRequestRef.current && error instanceof Error) setNotice({ source: 'library', message: error.message });
+        await loadLibrary(true, controller.signal);
       } finally {
         pending = false;
-        if (!controller.signal.aborted) setLoading(false);
       }
     };
     document.addEventListener('visibilitychange', refresh);
@@ -194,7 +193,7 @@ export default function Home() {
       window.clearInterval(timer);
       document.removeEventListener('visibilitychange', refresh);
     };
-  }, []);
+  }, [loadLibrary]);
 
   useEffect(() => {
     if (!historyFile) return;
@@ -303,7 +302,7 @@ export default function Home() {
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || 'Could not add that folder.');
       setShowAdd(false);
-      await loadLibrary(true);
+      if (await loadLibrary(true)) setNotice('');
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Could not add that folder.');
     }
@@ -378,7 +377,7 @@ export default function Home() {
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || 'Could not configure the archive.');
       setNotice('Creating the first protected copy of each Lavish…');
-      await loadLibrary(true);
+      if (await loadLibrary(true)) setNotice('');
       setShowArchive(true);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Could not configure the archive.');
