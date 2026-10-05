@@ -87,7 +87,7 @@ An available server does not confirm that an artifact rendered successfully. Car
 
 Snapshots retain the agent's `script[data-lavish-revisions]` JSON registry from the saved HTML in their manifest metadata, showing its labels, timestamps and summaries as **Agent-declared revisions**. These declarations describe the agent's revision context; they are separate from the archive's measured size and line changes. Missing or malformed registries add nothing. Older snapshots read their saved HTML on demand and cache the declarations, including empty results, while the companion is running. **Reveal server.log** appears under the server indicator when the configured state directory contains that ordinary file, including while the server is unavailable.
 
-Open [http://localhost:3000](http://localhost:3000). The library refreshes when the page loads, every five seconds while visible, when it regains focus, and whenever you press the refresh button.
+Open [http://localhost:3000](http://localhost:3000). The library refreshes when the page loads, every five seconds while visible, and whenever you press the refresh button.
 
 Library cards capture the artifact's first 1200 × 750 pixels locally using an installed Chrome or Chromium. No browser download is bundled: the small `puppeteer-core` driver uses Chrome on macOS or common Chromium/Chrome locations on Linux. Set `LAVISH_TRACKER_BROWSER` to the executable path for another installation. Without a working browser, cards show **Preview unavailable** and opening/history continue to work.
 

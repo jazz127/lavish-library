@@ -139,6 +139,8 @@ export default function Home() {
   const searchRef = useRef<HTMLInputElement>(null);
   const trackedSearchRef = useRef('');
   const libraryRequestRef = useRef(0);
+  const historyRefreshRef = useRef<(() => Promise<void>) | null>(null);
+  const historyFile = historyArtifact?.file;
 
   async function loadLibrary(quiet = false) {
     const request = ++libraryRequestRef.current;
@@ -186,23 +188,45 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    if (!library || !historyArtifact) return;
+    if (!historyFile) return;
     const controller = new AbortController();
+    let pending = false;
+    let queued = false;
     const refresh = async () => {
+      if (pending) {
+        queued = true;
+        return;
+      }
+      pending = true;
       try {
-        const response = await apiFetch(`/artifacts/versions?file=${encodeURIComponent(historyArtifact.file)}`, { cache: 'no-store', signal: controller.signal });
+        const response = await apiFetch(`/artifacts/versions?file=${encodeURIComponent(historyFile)}`, { cache: 'no-store', signal: controller.signal });
         const result: VersionHistory & { error?: string } = await response.json();
         if (!response.ok) throw new Error(result.error || 'Could not load version history.');
         if (!controller.signal.aborted) setHistory(result);
       } catch (error) {
         if (!controller.signal.aborted) setNotice(error instanceof Error ? error.message : 'Could not load version history.');
       } finally {
-        if (!controller.signal.aborted) setHistoryLoading(false);
+        pending = false;
+        if (!controller.signal.aborted) {
+          setHistoryLoading(false);
+          if (queued) {
+            queued = false;
+            void refresh();
+          }
+        }
       }
     };
+    historyRefreshRef.current = refresh;
     void refresh();
-    return () => controller.abort();
-  }, [library, historyArtifact]);
+    return () => {
+      controller.abort();
+      historyRefreshRef.current = null;
+    };
+  }, [historyFile]);
+
+  useEffect(() => {
+    if (library) void historyRefreshRef.current?.();
+  }, [library]);
 
   useEffect(() => {
     const handleShortcut = (event: KeyboardEvent) => {
@@ -372,6 +396,10 @@ export default function Home() {
   }
 
   function selectHistory(artifact: Artifact) {
+    if (artifact.file === historyFile) {
+      void historyRefreshRef.current?.();
+      return;
+    }
     setHistoryArtifact(artifact);
     setHistoryLoading(true);
     setHistory(null);
