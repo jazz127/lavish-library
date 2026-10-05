@@ -128,7 +128,8 @@ export default function Home() {
   const [view, setView] = useState<'grid' | 'list'>('grid');
   const [section, setSection] = useState<PageSection>('library');
   const [loading, setLoading] = useState(true);
-  const [notice, setNotice] = useState('');
+  const [notice, setNotice] = useState<string | { source: 'library' | 'history'; message: string }>('');
+  const noticeMessage = typeof notice === 'string' ? notice : notice.message;
   const [manualPath, setManualPath] = useState('');
   const [showAdd, setShowAdd] = useState(false);
   const [showArchive, setShowArchive] = useState(false);
@@ -171,9 +172,12 @@ export default function Home() {
         const response = await apiFetch('/library', { cache: 'no-store', signal: controller.signal });
         if (!response.ok) throw new Error('The local library service did not respond.');
         const value: Library = await response.json();
-        if (!controller.signal.aborted && request === libraryRequestRef.current) setLibrary(value);
+        if (!controller.signal.aborted && request === libraryRequestRef.current) {
+          setLibrary(value);
+          setNotice((current) => typeof current !== 'string' && current.source === 'library' ? '' : current);
+        }
       } catch (error) {
-        if (!controller.signal.aborted && request === libraryRequestRef.current && error instanceof Error) setNotice(error.message);
+        if (!controller.signal.aborted && request === libraryRequestRef.current && error instanceof Error) setNotice({ source: 'library', message: error.message });
       } finally {
         pending = false;
         if (!controller.signal.aborted) setLoading(false);
@@ -202,9 +206,12 @@ export default function Home() {
         const response = await apiFetch(`/artifacts/versions?file=${encodeURIComponent(historyFile)}`, { cache: 'no-store', signal: controller.signal });
         const result: VersionHistory & { error?: string } = await response.json();
         if (!response.ok) throw new Error(result.error || 'Could not load version history.');
-        if (!controller.signal.aborted) setHistory(result);
+        if (!controller.signal.aborted) {
+          setHistory(result);
+          setNotice((current) => typeof current !== 'string' && current.source === 'history' ? '' : current);
+        }
       } catch (error) {
-        if (!controller.signal.aborted) setNotice(error instanceof Error ? error.message : 'Could not load version history.');
+        if (!controller.signal.aborted) setNotice({ source: 'history', message: error instanceof Error ? error.message : 'Could not load version history.' });
       } finally {
         pending = false;
         if (!controller.signal.aborted) {
@@ -588,7 +595,7 @@ export default function Home() {
             </div>
           </div>
 
-          {notice && <div className="notice" role="status">{notice}</div>}
+          {noticeMessage && <div className="notice" role="status">{noticeMessage}</div>}
 
           {loading ? (
             <div className="loading-grid">{[1, 2, 3, 4, 5, 6].map((item) => <div className="skeleton" key={item} />)}</div>

@@ -8,7 +8,7 @@ import { backupFixture, freePort } from './helpers/backup-fixture.mjs';
 
 // Opt in with LAVISH_BACKUP_UI_TEST=1. The actual Home component and apiFetch
 // run against a synthetic companion fixture in an isolated browser session.
-test('synthetic browser covers backup states, read failures and slow history refreshes', { skip: process.env.LAVISH_BACKUP_UI_TEST !== '1' }, async () => {
+test('synthetic browser covers backup states, refresh notices and slow history', { skip: process.env.LAVISH_BACKUP_UI_TEST !== '1' }, async () => {
   const { build } = await import('esbuild');
   const uiPort = await freePort();
   const session = `lavish-issue-24-${process.pid}`;
@@ -54,6 +54,14 @@ test('synthetic browser covers backup states, read failures and slow history ref
     `);
     const refresh = `await page.click('[aria-label="Refresh library"]'); await page.wait('.artifact-card');`;
     const restorableHistory = `await page.wait(() => { const buttons = document.querySelectorAll('.version-actions button:last-child'); return buttons.length > 0 && !document.querySelector('.version-row.current') && [...buttons].every((button) => !button.disabled); });`;
+    const refreshApplied = `await page.wait(() => {
+      const fixture = window.refreshNotices;
+      const count = fixture.successes[fixture.target];
+      if (count < fixture.expected) return false;
+      return fixture.target === 'library'
+        ? document.querySelector('.description')?.textContent === 'Library recovery ' + count
+        : document.querySelector('.version-row:first-child .version-content > p')?.textContent.includes((10000 + count).toLocaleString() + ' lines');
+    });`;
     try {
       await check(`await page.open('http://127.0.0.1:${uiPort}'); await page.wait('.artifact-card');
         assert((await page.eval(() => document.querySelector('.backup-status').textContent)).includes('Archive disabled'), 'disabled state missing');`);
@@ -214,6 +222,40 @@ test('synthetic browser covers backup states, read failures and slow history ref
         assert(await page.eval(() => !document.querySelector('.history-drawer') && window.slowHistory.completed === window.completedBeforeClose && window.slowHistory.records.length === window.requestsBeforeClose), 'closed drawer published or queued history');
         await page.eval(() => { window.fetch = window.slowHistory.originalFetch; });
         await page.click('.history-chip'); await page.wait('.version-row.current');`);
+      await check(`await page.eval(() => {
+        const original = window.fetch;
+        window.refreshNotices = { originalFetch: original, failure: null, successes: { library: 0, history: 0 }, actionMessage: 'Unrelated action notice' };
+        window.fetch = async (...args) => {
+          const url = String(args[0]);
+          const source = url.endsWith('/library') ? 'library' : url.includes('/artifacts/versions?') ? 'history' : null;
+          if (url.endsWith('/artifacts/reveal')) return new Response(JSON.stringify({ error: window.refreshNotices.actionMessage }), { status: 400 });
+          if (source && window.refreshNotices.failure === source) return new Response(JSON.stringify({ error: 'Synthetic history refresh outage' }), { status: 503 });
+          const response = await original(...args);
+          if (!source || !response.ok) return response;
+          const value = await response.json();
+          const count = ++window.refreshNotices.successes[source];
+          if (source === 'library') value.artifacts[0].description = 'Library recovery ' + count;
+          else value.versions[0].lineCount = 10000 + count;
+          return new Response(JSON.stringify(value), { status: response.status, headers: response.headers });
+        };
+      });`);
+      for (const source of ['library', 'history']) {
+        const message = source === 'library' ? 'The local library service did not respond.' : 'Synthetic history refresh outage';
+        await check(`await page.eval(() => { window.refreshNotices.failure = ${JSON.stringify(source)}; });
+          await page.wait(() => document.querySelector('.notice')?.textContent === ${JSON.stringify(message)});
+          await page.eval(() => { window.refreshNotices.target = ${JSON.stringify(source)}; window.refreshNotices.expected = window.refreshNotices.successes[${JSON.stringify(source)}] + 1; window.refreshNotices.failure = null; });
+          ${refreshApplied}
+          await page.wait(() => !document.querySelector('.notice'));
+          assert(await page.eval(() => !!document.querySelector('.version-row.current')), 'refresh recovery dropped the drawer');`);
+        await check(`await page.eval(() => { window.refreshNotices.failure = ${JSON.stringify(source)}; });
+          await page.wait(() => document.querySelector('.notice')?.textContent === ${JSON.stringify(message)});
+          await page.click('[aria-label="Reveal in Finder"]');
+          await page.wait(() => document.querySelector('.notice')?.textContent === window.refreshNotices.actionMessage);
+          await page.eval(() => { window.refreshNotices.expected = window.refreshNotices.successes[${JSON.stringify(source)}] + 1; window.refreshNotices.failure = null; });
+          ${refreshApplied}
+          assert(await page.eval(() => document.querySelector('.notice')?.textContent === window.refreshNotices.actionMessage), '${source} recovery cleared an unrelated action notice');`);
+      }
+      await check(`await page.eval(() => { window.fetch = window.refreshNotices.originalFetch; });`);
       await configure(false);
       await check(`${refresh} assert((await page.eval(() => document.querySelector('.backup-status').textContent)).includes('Archive disabled'), 'disable did not clear protection');
         await page.wait('.history-empty');
