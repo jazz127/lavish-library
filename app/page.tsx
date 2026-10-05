@@ -145,7 +145,7 @@ export default function Home() {
 
   const loadLibrary = useCallback(async (quiet = false, signal?: AbortSignal): Promise<Library | undefined> => {
     if (!quiet) setLoading(true);
-    const request: Promise<Library | undefined> = (async () => {
+    const fetchLibrary = async (): Promise<Library | undefined> => {
       try {
         const response = await apiFetch('/library', { cache: 'no-store', signal });
         if (!response.ok) throw new Error('The local library service did not respond.');
@@ -162,7 +162,8 @@ export default function Home() {
       } finally {
         if (!signal?.aborted && request === libraryRequestRef.current) setLoading(false);
       }
-    })();
+    };
+    const request = fetchLibrary();
     libraryRequestRef.current = request;
     let latest = request;
     for (;;) {
