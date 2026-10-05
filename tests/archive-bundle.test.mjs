@@ -189,6 +189,10 @@ async function editPublishedDependency(context, publication, versionCount) {
   const published = await history();
   assert.equal(published.versions.length, versionCount);
   const icon = path.join(sourceDir, 'assets/nested/icon.png');
+  // macOS starts its native FSEvents subscription asynchronously. Keep the
+  // publication paused while it starts, so installing watchers only after
+  // the snapshot/scan resolves still cannot capture this edit.
+  if (process.platform === 'darwin') await new Promise((resolve) => setTimeout(resolve, 300));
   await writeFile(icon, 'edited-after-publication');
   resumePublication();
   await publication;
