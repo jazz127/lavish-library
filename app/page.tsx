@@ -168,6 +168,7 @@ export default function Home() {
     let pending = false;
     const refresh = async () => {
       if (pending || document.visibilityState === 'hidden') return;
+      document.removeEventListener('visibilitychange', refresh);
       pending = true;
       const request = ++libraryRequestRef.current;
       try {
@@ -185,9 +186,9 @@ export default function Home() {
         if (!controller.signal.aborted) setLoading(false);
       }
     };
+    document.addEventListener('visibilitychange', refresh);
     void refresh();
     const timer = window.setInterval(() => void refresh(), 5000);
-    document.addEventListener('visibilitychange', refresh);
     return () => {
       controller.abort();
       window.clearInterval(timer);

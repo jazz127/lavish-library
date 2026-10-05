@@ -75,7 +75,7 @@ test('synthetic library refresh regressions', { skip: process.env.LAVISH_BACKUP_
         `);
       });
     }
-    await t.test('hidden initial load refreshes immediately on visibility and cleans up', async () => {
+    await t.test('hidden initial load resumes on visibility and keeps polling', async () => {
       await check(`
         await page.open('${url}?hidden');
         await wait(() => typeof window.fixture.poll === 'function');
@@ -88,9 +88,33 @@ test('synthetic library refresh regressions', { skip: process.env.LAVISH_BACKUP_
         await wait(() => !!document.querySelector('.artifact-card'));
         await page.eval(() => { fixture.hidden = true; document.dispatchEvent(new Event('visibilitychange')); fixture.poll(); });
         assert(await page.eval(() => fixture.requests.length === 1), 'hidden poll started a request');
+        await page.eval(() => { fixture.hidden = false; document.dispatchEvent(new Event('visibilitychange')); });
+        await page.eval(() => new Promise((resolve) => setTimeout(resolve, 50)));
+        assert(await page.eval(() => fixture.requests.length === 1), 'later tab return refreshed the loaded library');
+        await page.eval(() => fixture.poll());
+        await wait(() => window.fixture.requests.length === 2);
+        await page.eval(() => fixture.requests[1].complete(libraryValue(true, 'Polled library')));
+        await wait(() => document.querySelector('.description')?.textContent === 'Polled library');
+      `);
+    });
+    await t.test('visible initial load does not refresh on later tab returns', async () => {
+      await check(`
+        await page.open('${url}');
+        await wait(() => window.fixture.requests.length === 1);
+        await page.eval(() => fixture.requests[0].complete(libraryValue(true)));
+        await wait(() => !!document.querySelector('.artifact-card'));
+        await page.eval(() => { fixture.hidden = true; document.dispatchEvent(new Event('visibilitychange')); fixture.hidden = false; document.dispatchEvent(new Event('visibilitychange')); });
+        await page.eval(() => new Promise((resolve) => setTimeout(resolve, 50)));
+        assert(await page.eval(() => fixture.requests.length === 1), 'later tab return refreshed the loaded library');
+      `);
+    });
+    await t.test('unmount cleans up the skipped initial load listener', async () => {
+      await check(`
+        await page.open('${url}?hidden');
+        await wait(() => typeof window.fixture.poll === 'function');
         await page.eval(() => { window.unmountHome(); fixture.hidden = false; document.dispatchEvent(new Event('visibilitychange')); });
         await page.eval(() => new Promise((resolve) => setTimeout(resolve, 50)));
-        assert(await page.eval(() => fixture.requests.length === 1), 'unmounted page retained visibility listener');
+        assert(await page.eval(() => fixture.requests.length === 0), 'unmounted page retained visibility listener');
       `);
     });
   } finally {
