@@ -17,6 +17,9 @@ async function eventually(read, predicate, timeout = 30_000) {
   throw new Error('Preview did not reach the expected state');
 }
 
+// The hosted Linux runner is slower at serial Chrome launches than developer machines.
+const previewTimeout = process.env.CI === 'true' ? 120_000 : 30_000;
+
 async function fixture(run, { browser } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'lavish-previews-'));
   const sourceDir = path.join(directory, 'project', '.lavish');
@@ -82,14 +85,14 @@ test('artifact preview API renders distinct local artifacts, caches, and refresh
     const initial = await Promise.all([red, blue].map((artifact) => preview(artifact.id)));
     t.diagnostic(`Synthetic preview endpoint sample: 2 artifacts scanned; HTTP statuses ${initial.map((value) => value.response.status).join(', ')}.`);
     assert.equal(initial[0].response.status, 202);
-    const redImage = await eventually(() => preview(red.id), (value) => value.png);
-    const blueImage = await eventually(() => preview(blue.id), (value) => value.png);
+    const redImage = await eventually(() => preview(red.id), (value) => value.png, previewTimeout);
+    const blueImage = await eventually(() => preview(blue.id), (value) => value.png, previewTimeout);
     assert.deepEqual(redImage.png.subarray(0, 8), Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]));
     assert.notDeepEqual(redImage.png, blueImage.png);
     assert.deepEqual((await preview(red.id)).png, redImage.png);
     await writeFile(path.join(sourceDir, 'red.css'), 'body { background: #00ff00; }');
     await library();
-    const refreshed = await eventually(() => preview(red.id), (value) => value.png && !value.png.equals(redImage.png));
+    const refreshed = await eventually(() => preview(red.id), (value) => value.png && !value.png.equals(redImage.png), previewTimeout);
     assert.notDeepEqual(refreshed.png, redImage.png);
   });
 });

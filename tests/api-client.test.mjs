@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { apiBase } from '../scripts/remote-access.mjs';
 
 test('bootstraps a browser token and renews it once after a service restart', async () => {
   const originalFetch = globalThis.fetch;
@@ -27,5 +28,27 @@ test('bootstraps a browser token and renews it once after a service restart', as
     ]);
   } finally {
     globalThis.fetch = originalFetch;
+  }
+});
+
+test('bootstraps and sends authorized requests to the configured absolute companion URL', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.__LAVISH_TRACKER_API_BASE__ = apiBase({ LAVISH_TRACKER_API_BASE: 'https://library.example.com:8443/' });
+  globalThis.fetch = async (url, init = {}) => {
+    calls.push({ url: String(url), method: init.method || 'GET', token: new Headers(init.headers).get('x-lavish-token') });
+    return new Response(JSON.stringify(calls.length === 1 ? { token: 'remote-token' } : { ok: true }));
+  };
+  try {
+    const { apiFetch } = await import(`../app/api-client.ts?remote=${Date.now()}`);
+    const response = await apiFetch('/events', { method: 'POST', body: JSON.stringify({ type: 'search' }) });
+    assert.equal(response.status, 200);
+    assert.deepEqual(calls, [
+      { url: 'https://library.example.com:8443/api/session', method: 'GET', token: null },
+      { url: 'https://library.example.com:8443/api/events', method: 'POST', token: 'remote-token' },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.__LAVISH_TRACKER_API_BASE__;
   }
 });

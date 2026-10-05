@@ -12,6 +12,7 @@ export async function browserExecutable() {
 
 const CONTENT_TYPES = { '.html': 'text/html', '.htm': 'text/html', '.css': 'text/css', '.js': 'text/javascript', '.mjs': 'text/javascript', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif', '.woff': 'font/woff', '.woff2': 'font/woff2' };
 const CSP = "default-src 'none'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; media-src 'self' data:; connect-src 'none'; frame-src 'none'; worker-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; sandbox allow-scripts allow-same-origin";
+const hostedLinux = process.platform === 'linux' && process.env.CI === 'true';
 
 // Render the exact collected bytes. No HTTP request is ever continued to a
 // network server, and no file:// URL or filesystem path reaches the browser.
@@ -19,13 +20,20 @@ export async function capturePreview(artifact, bundle) {
   const { default: puppeteer } = await import('puppeteer-core');
   const browser = await puppeteer.launch({
     executablePath: await browserExecutable(), headless: true,
-    timeout: 10_000, protocolTimeout: 10_000,
+    timeout: hostedLinux ? 30_000 : 10_000,
+    protocolTimeout: hostedLinux ? 30_000 : 10_000,
     // The companion owns its signal lifecycle. Puppeteer's default SIGTERM
     // handler would close Chrome but leave the HTTP service running.
     handleSIGTERM: false, handleSIGINT: false, handleSIGHUP: false,
-    args: ['--disable-background-networking', '--disable-component-update', '--no-first-run', '--host-resolver-rules=MAP * ~NOTFOUND', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'],
+    args: [
+      '--disable-background-networking', '--disable-component-update', '--no-first-run',
+      '--host-resolver-rules=MAP * ~NOTFOUND', '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+      // Hosted Linux can restrict user namespaces and expose little /dev/shm.
+      // CI options relax Chrome's sandbox; interception and CSP still bound resources.
+      ...(hostedLinux ? ['--no-sandbox', '--disable-dev-shm-usage'] : []),
+    ],
   });
-  const deadline = setTimeout(() => { browser.process()?.kill('SIGKILL'); }, 15_000);
+  const deadline = setTimeout(() => { browser.process()?.kill('SIGKILL'); }, hostedLinux ? 60_000 : 15_000);
   try {
     const page = await browser.newPage();
     await page.setViewport({ width: 1200, height: 750, deviceScaleFactor: 1 });
@@ -46,7 +54,7 @@ export async function capturePreview(artifact, bundle) {
     });
     page.on('dialog', (dialog) => { void dialog.dismiss().catch(() => {}); });
     browser.on('targetcreated', (target) => { if (target.type() === 'page') void target.page().then((popup) => popup?.close()).catch(() => {}); });
-    await page.goto(entry, { waitUntil: 'networkidle0', timeout: 8_000 });
+    await page.goto(entry, { waitUntil: 'networkidle0', timeout: hostedLinux ? 30_000 : 8_000 });
     await page.emulateMediaFeatures([{ name: 'prefers-reduced-motion', value: 'reduce' }]);
     return Buffer.from(await page.screenshot({ type: 'png' }));
   } finally {

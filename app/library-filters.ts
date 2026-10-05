@@ -4,7 +4,13 @@ export type FilterableArtifact = {
   description: string;
   file: string;
   sessionStatus: 'open' | 'feedback' | 'ended' | 'discovered';
+  artifactFailures?: { kind: string; detail: string }[];
 };
+
+// Failures recorded for an ended review no longer need attention.
+export function visibleArtifactFailures(artifact: Pick<FilterableArtifact, 'sessionStatus' | 'artifactFailures'>) {
+  return artifact.sessionStatus === 'ended' ? [] : artifact.artifactFailures ?? [];
+}
 
 export type LibraryFilter = {
   selectedProject: string;
@@ -14,6 +20,12 @@ export type LibraryFilter = {
 };
 
 export type LibraryFilterScope = Omit<LibraryFilter, 'statusFilter'>;
+
+// Call when the filtered list is empty; use the unfiltered library to explain why.
+export function getLibraryEmptyReason(artifacts: FilterableArtifact[], selectedProject: string): 'library' | 'project' | 'filters' {
+  if (selectedProject !== 'all' && !artifacts.some((artifact) => artifact.projectId === selectedProject)) return 'project';
+  return artifacts.length === 0 ? 'library' : 'filters';
+}
 
 export function filterLibraryArtifacts<T extends FilterableArtifact>(artifacts: T[], filter: LibraryFilter) {
   const needle = filter.query.trim().toLowerCase();

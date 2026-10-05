@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, realpath, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, realpath, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
@@ -109,6 +109,166 @@ test('explicit none clears an outcome while omitted fields retain feedback', asy
     assert.equal(cleared.feedback.outcome, null);
     assert.equal(cleared.feedback.note, null);
     assert.equal(cleared.feedback.value, 'unfinished');
+  });
+});
+
+// All sources and timestamps below are synthetic. Backdating fixture activity
+// simulates an idle period without waiting 30 days or changing the API's clock.
+async function dormantFixture(context, { replies = 0, revisions = false } = {}) {
+  const { api, post, file, stateDir, configDir } = context;
+  const old = new Date(Date.now() - 60 * 86_400_000);
+  const chat = Array.from({ length: replies }, () => ({ role: 'agent', text: 'Reply', at: old.toISOString() }));
+  await writeFile(path.join(stateDir, 'state.json'), JSON.stringify({ sessions: { demo: { file, updated_at: old.toISOString(), chat } } }));
+  const get = async (route) => {
+    const response = await fetch(`${api}${route}`);
+    const result = await response.json();
+    assert.equal(response.ok, true, result.error);
+    return result;
+  };
+  const history = () => get(`/artifacts/versions?file=${encodeURIComponent(file)}`);
+  if (revisions) {
+    await writeFile(path.join(configDir, 'config.json'), JSON.stringify({ projects: [], archiveRoot: path.join(path.dirname(configDir), 'archive') }));
+    assert.equal((await post('/artifacts/snapshot', { file })).ok, true);
+    await writeFile(file, '<title>Review plan</title><p>Revised plan</p>');
+    assert.equal((await post('/artifacts/snapshot', { file })).ok, true);
+    const { archivePath, versions } = await history();
+    assert.equal(versions.length, 2);
+    const manifestFile = path.join(archivePath, 'manifest.json');
+    const manifest = JSON.parse(await readFile(manifestFile, 'utf8'));
+    for (const version of manifest.versions) version.createdAt = old.toISOString();
+    await writeFile(manifestFile, JSON.stringify(manifest));
+  }
+  await utimes(file, old, old);
+  const library = await get('/library');
+  assert.equal(library.artifacts.length, 1);
+  const artifact = library.artifacts[0];
+  assert.equal(artifact.sessionMessages, replies);
+  assert.equal(artifact.versionCount, revisions ? 2 : 0);
+  const source = await readFile(file, 'utf8');
+  const { archivePath, versions } = await history();
+  const archivedBytes = await Promise.all(versions.map((version) => readFile(path.join(archivePath, version.file))));
+  const analyticsFile = path.join(configDir, 'analytics.json');
+  let savedFeedback;
+  let changes = 0;
+  const feedback = async (input) => {
+    const response = await post('/artifacts/feedback', { file, ...input });
+    assert.equal(response.ok, true);
+    savedFeedback = (await response.json()).feedback;
+    // Feedback is activity: freshly changed labels must not bypass dormancy.
+    assert.equal((await get('/insights?days=3650')).dormant.length, 0);
+    const analytics = JSON.parse(await readFile(analyticsFile, 'utf8'));
+    analytics.feedback[artifact.id].updatedAt = old.toISOString();
+    savedFeedback.updatedAt = old.toISOString();
+    await writeFile(analyticsFile, JSON.stringify(analytics));
+    changes += 1;
+  };
+  const assertEligible = async (eligible) => {
+    const insights = await get('/insights?days=3650');
+    assert.deepEqual(insights.dormant.map((item) => item.id), eligible ? [artifact.id] : []);
+    const recommendation = insights.recommendations.find((item) => item.id === 'review-dormant');
+    assert.equal(Boolean(recommendation), eligible);
+    if (eligible) {
+      assert.equal(recommendation.title, 'Revisit 1 dormant gem');
+      assert.equal(recommendation.evidence, artifact.title);
+    }
+    assert.equal(insights.review.highlights.some((item) => item.tone === 'dormant'), eligible);
+    assert.equal(insights.summary.totalArtifacts, 1);
+    assert.equal(insights.summary.sessionReplies, replies);
+    assert.equal(insights.summary.versions, versions.length);
+    assert.equal((await get('/library')).artifacts[0].id, artifact.id);
+    assert.equal(await readFile(file, 'utf8'), source);
+    assert.deepEqual((await history()).versions, versions);
+    assert.deepEqual(await Promise.all(versions.map((version) => readFile(path.join(archivePath, version.file)))), archivedBytes);
+    if (savedFeedback) {
+      const analytics = JSON.parse(await readFile(analyticsFile, 'utf8'));
+      assert.deepEqual(analytics.feedback[artifact.id], savedFeedback);
+      assert.equal(analytics.events.filter((event) => event.type === 'feedback').length, changes);
+      assert.equal(insights.evolution.filter((event) => event.type === 'feedback').length, changes);
+    }
+  };
+  return { assertEligible, feedback };
+}
+
+const dormantCases = [
+  { name: 'abandoned outcome alone', feedback: { outcome: 'abandoned' }, eligible: false },
+  { name: 'abandoned with replies', replies: 2, feedback: { outcome: 'abandoned' }, eligible: false },
+  { name: 'abandoned with revisions', revisions: true, feedback: { outcome: 'abandoned' }, eligible: false },
+  { name: 'disposable with replies', replies: 2, feedback: { value: 'disposable' }, eligible: false },
+  { name: 'disposable with revisions', revisions: true, feedback: { value: 'disposable' }, eligible: false },
+  { name: 'useful but abandoned', replies: 2, revisions: true, feedback: { value: 'useful', outcome: 'abandoned' }, eligible: false },
+  { name: 'disposable but shipped', replies: 2, revisions: true, feedback: { value: 'disposable', outcome: 'shipped' }, eligible: false },
+  { name: 'useful feedback alone', feedback: { value: 'useful' }, eligible: true },
+  { name: 'shipped outcome alone', feedback: { outcome: 'shipped' }, eligible: true },
+  { name: 'revisions alone', revisions: true, eligible: true },
+  { name: 'replies alone', replies: 2, eligible: true },
+  { name: 'no positive evidence', eligible: false },
+];
+
+for (const scenario of dormantCases) {
+  test(`dormant suggestions respect ${scenario.name}`, async () => {
+    await fixture(async (context) => {
+      const dormant = await dormantFixture(context, scenario);
+      if (scenario.feedback) await dormant.feedback(scenario.feedback);
+      await dormant.assertEligible(scenario.eligible);
+    });
+  });
+}
+
+for (const evidence of [{ name: 'replies', replies: 2 }, { name: 'revisions', revisions: true }, { name: 'no engagement' }]) {
+  test(`dormant eligibility recomputes after feedback changes with ${evidence.name}`, async () => {
+    await fixture(async (context) => {
+      const dormant = await dormantFixture(context, evidence);
+      const hasEngagement = Boolean(evidence.replies || evidence.revisions);
+      await dormant.assertEligible(hasEngagement);
+      const changes = [
+        [{ outcome: 'abandoned' }, false],
+        [{ outcome: 'none' }, hasEngagement],
+        [{ value: 'useful', outcome: 'abandoned' }, false],
+        [{ outcome: 'none' }, true],
+        [{ value: 'disposable', outcome: 'shipped' }, false],
+        [{ value: 'unfinished' }, true],
+        [{ outcome: 'abandoned' }, false],
+        [{ outcome: 'reused' }, true],
+        [{ value: 'disposable', outcome: 'none' }, false],
+        [{ value: 'unfinished' }, hasEngagement],
+      ];
+      for (const [feedback, eligible] of changes) {
+        await dormant.feedback(feedback);
+        await dormant.assertEligible(eligible);
+      }
+    });
+  });
+}
+
+test('dormant recommendations count only eligible artifacts in a mixed library', async () => {
+  await fixture(async (context) => {
+    const { api, post, file, lavishDir, stateDir, configDir } = context;
+    const dormant = await dormantFixture(context, { replies: 2 });
+    await dormant.feedback({ value: 'useful' });
+    const old = new Date(Date.now() - 60 * 86_400_000);
+    const sessions = JSON.parse(await readFile(path.join(stateDir, 'state.json'), 'utf8')).sessions;
+    for (const name of ['abandoned', 'disposable']) {
+      const negativeFile = path.join(lavishDir, `${name}.html`);
+      await writeFile(negativeFile, `<title>${name} work</title>`);
+      await utimes(negativeFile, old, old);
+      sessions[name] = { file: negativeFile, updated_at: old.toISOString(), chat: sessions.demo.chat };
+    }
+    await writeFile(path.join(stateDir, 'state.json'), JSON.stringify({ sessions }));
+    assert.equal((await fetch(`${api}/library`)).ok, true);
+    assert.equal((await post('/artifacts/feedback', { file: sessions.abandoned.file, value: 'useful', outcome: 'abandoned' })).ok, true);
+    assert.equal((await post('/artifacts/feedback', { file: sessions.disposable.file, value: 'disposable', outcome: 'shipped' })).ok, true);
+    const analyticsFile = path.join(configDir, 'analytics.json');
+    const analytics = JSON.parse(await readFile(analyticsFile, 'utf8'));
+    for (const feedback of Object.values(analytics.feedback)) feedback.updatedAt = old.toISOString();
+    await writeFile(analyticsFile, JSON.stringify(analytics));
+    const response = await fetch(`${api}/insights?days=3650`);
+    assert.equal(response.ok, true);
+    const insights = await response.json();
+    assert.deepEqual(insights.dormant.map((item) => item.file), [file]);
+    const recommendation = insights.recommendations.find((item) => item.id === 'review-dormant');
+    assert.equal(recommendation.title, 'Revisit 1 dormant gem');
+    assert.equal(recommendation.evidence, 'Review plan');
+    assert.equal(insights.summary.totalArtifacts, 3);
   });
 });
 

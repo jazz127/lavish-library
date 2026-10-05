@@ -8,6 +8,8 @@ A private, local-first browser library for finding and reopening Lavish review s
 - Automatically groups known artifacts by project
 - Finds additional HTML artifacts in project `.lavish` folders (generated `.export.html` and `-portable.html` copies are omitted unless opened in Lavish)
 - Shows session state, server availability, last-used time, edit time, and file size
+- Explains Lavish's recorded artifact/local-asset failures separately from server availability
+- Shows agent-declared revision context on saved artifact timelines and reveals local `server.log` in Finder when available
 - Searches, filters, sorts, and switches between grid and list views
 - Opens or reopens an artifact with `lavish-axi`
 - Reveals an artifact in Finder
@@ -30,7 +32,7 @@ The sidebar exposes two complementary destinations directly:
 - **Signal Observatory** shows the evidence: activity, repeat-use signals, topic shelves, searches, recurring Lavish shapes, and the evolving timeline of versions, sessions, restores, feedback, and Git commits.
 - **Lavish Review** turns that evidence into a calm narrative, an actionable recommendation queue, dormant work worth revisiting, possible templates, and quick value/outcome labels.
 
-The app distinguishes recorded evidence from unknown history. It can backfill file dates, known Lavish sessions, protected versions, and local Git commits; searches and library interactions begin recording with v0.2.
+The app distinguishes recorded evidence from unknown history. It can backfill file dates, known Lavish sessions, protected versions, and local Git commits; searches and library interactions begin recording with v0.2. Artifacts labelled **Disposable** or **Abandoned** are excluded from dormant gems even when they have revisions or agent replies.
 
 ## Versions
 
@@ -53,7 +55,9 @@ The push to `main` runs Release Please, which is explicitly pinned to `main` eve
 
 Choose **Set up archive** in the app and select any local or synced folder. The app creates a readable `Lavish Library Archive` beneath it, grouped by project and artifact. Each version has its own HTML file, local assets, a complete bundle checksum, timestamps, and manifest entry. Identity includes the HTML bytes and the paths, bytes, and availability of its bounded local dependencies, so CSS and image edits create versions even when HTML is unchanged.
 
-The first scan creates a baseline. While the app is running, watched files are backed up shortly after each saved change; a 30-second reconciliation scan catches new artifacts and anything a watcher missed. Restoring an older version archives the current bundle first, including any files the restore will overwrite even if the current HTML no longer references them. Missing dependency files are restored to their missing state after preserving any newer local bytes; directories and other Lavish artifacts at those paths are left in place. Pausing backups never deletes existing copies.
+The first scan creates a baseline. While the app is running, watched files are backed up shortly after each saved change; a 30-second reconciliation scan catches new artifacts and anything a watcher missed. Restoring an older version archives the current bundle first, including any files the restore will overwrite even if the current HTML no longer references them. Missing dependency files are restored to their missing state after preserving any newer local bytes; directories and other Lavish artifacts at those paths are left in place. Pausing backups never deletes existing copies. A restore that has begun writing finishes its history in the archive containing its safety copy, even if backups are paused or the archive folder changes during the restore.
+
+If a backup fails, the library card and history drawer mark the latest content as not protected, show the error and the last successful backup date, and keep earlier copies available. Saved history remains available when reading the current bundle fails; unreadable bundles are not marked as current. The archive panel counts latest-protected, unprotected, and failed artifacts. Use **Retry backup** on the card or **Back up now** in the history drawer after resolving the reported error.
 
 If a source HTML file is deleted, its matching archive manifest keeps it in the library with its saved history. Restore recreates the HTML and archived assets in the existing source directory and resumes watching changes immediately. Recovery does not recreate a deleted project or source directory, and refuses symlinked source directories and destinations. With no current HTML there is no pre-restore source snapshot; archived assets replace the corresponding local assets. Opening, revealing, and manually backing up a source still require it to exist.
 
@@ -79,7 +83,11 @@ LAVISH_AXI_BIN="$(command -v lavish-axi)" npm run dev
 
 The library health check uses `LAVISH_AXI_PORT` (default `4387`), matching the port used by the CLI. When Lavish reports an installation identity (v0.1.78+), the library checks that it belongs to the configured state directory. The configured state directory remains `LAVISH_AXI_STATE_DIR` or `~/.lavish-axi`.
 
-Open [http://localhost:3000](http://localhost:3000). The library refreshes when the page loads and whenever you press the refresh button.
+An available server does not confirm that an artifact rendered successfully. Cards with recorded fatal `artifact_failures` keep their review status (such as **Feedback waiting**) and add a separate **Review failed** badge with an expandable explanation. **Live** means an open session on an available server, not a successful render, so failed open sessions stay in **Live** with the badge. Ended reviews show no failure badge. These are the last diagnostics retained in Lavish's state; Lavish may clear them after delivering them to the agent. The library does not infer recovery from an HTTP health response. Older sessions without diagnostics add no warning.
+
+Snapshots retain the agent's `script[data-lavish-revisions]` JSON registry from the saved HTML in their manifest metadata, showing its labels, timestamps and summaries as **Agent-declared revisions**. These declarations describe the agent's revision context; they are separate from the archive's measured size and line changes. Missing or malformed registries add nothing. Older snapshots read their saved HTML on demand and use a bounded cache for declarations, including empty results, while the companion is running. **Reveal server.log** appears under the server indicator when the configured state directory contains that ordinary file, including while the server is unavailable.
+
+Open [http://localhost:3000](http://localhost:3000). The initial library load waits until the tab is visible. After that, the library refreshes every five seconds while visible and whenever you press the refresh button. An open history drawer also refreshes its saved versions and current-version labels as library updates arrive.
 
 Library cards capture the artifact's first 1200 × 750 pixels locally using an installed Chrome or Chromium. No browser download is bundled: the small `puppeteer-core` driver uses Chrome on macOS or common Chromium/Chrome locations on Linux. Set `LAVISH_TRACKER_BROWSER` to the executable path for another installation. Without a working browser, cards show **Preview unavailable** and opening/history continue to work.
 
@@ -100,7 +108,28 @@ npm run build
 npm start
 ```
 
-The web UI listens on localhost and its filesystem companion service listens on `127.0.0.1:4318`. The companion service accepts browser requests only from `localhost` or `127.0.0.1` on the configured UI port, issues a fresh in-memory authorization token each time it starts, and limits artifact operations to files discovered by the same bounded scan used to build the library.
+By default, the web UI listens on `127.0.0.1:3000` and its filesystem companion service listens on `127.0.0.1:4318`. The default browser origins are `http://localhost:<UI port>` and `http://127.0.0.1:<UI port>`. The companion issues a fresh in-memory authorization token each time it starts and limits artifact operations to files discovered by the same bounded scan used to build the library. See [Optional private-network access](#optional-private-network-access) to configure access from other devices.
+
+### Optional private-network access
+
+To make both services reachable on a trusted private network, set `LAVISH_TRACKER_BIND_HOST` to the interface address or hostname to bind and set `LAVISH_TRACKER_ALLOWED_ORIGINS` to a comma-separated list of exact browser origins. An explicit allowlist replaces the default origins. Origins must include the scheme and port when one is used; paths, wildcards, and lists containing no origins are rejected. The companion accepts `Host` hostnames derived from those origins and the bind address. `LAVISH_TRACKER_UI_PORT` controls the UI port for both `npm run dev` and `npm start`; `LAVISH_TRACKER_API_PORT` controls the companion port. IPv6 bind addresses may be bracketed or unbracketed; URLs must use brackets, and binding to `::1` also adds `http://[::1]:<UI port>` to the default origins. Set `LAVISH_TRACKER_API_BASE` to the reachable IPv6 companion URL when using an IPv6-only bind.
+
+Both launch commands load settings from the project root before starting either service. Shell environment values take precedence, followed by `.env.<mode>.local`, `.env.local`, `.env.<mode>`, and `.env`, where `<mode>` is `development` for `npm run dev` and `production` for `npm start`. A shared `.env.local` can hold the bind host, origins, ports, and API base; these files are ignored by Git.
+
+For example, serve the UI and companion through separate HTTPS ports on a private-network hostname:
+
+```bash
+LAVISH_TRACKER_BIND_HOST=0.0.0.0 \
+LAVISH_TRACKER_ALLOWED_ORIGINS=https://library.example.com \
+LAVISH_TRACKER_API_BASE=https://library.example.com:8443 \
+npm run dev
+```
+
+Configure the HTTPS front to forward the UI port to the app and its separate companion port to the configured filesystem service port, preserving the hostname in `Host`. The companion's HTTPS port serves `/api/*` directly. `LAVISH_TRACKER_API_BASE` must be an absolute HTTP(S) URL reachable by the browser; relative API paths are unsupported. For direct private-network access, use the UI's exact origin and the companion's reachable URL. Changing the companion port also requires updating the API base, whose default remains `http://127.0.0.1:4318`. `LAVISH_TRACKER_API_BASE` is compiled into the UI, so set it while running `npm run build`. Supply the bind host, allowed origins, and any configured ports when starting a production build; changing the API base at startup requires rebuilding the UI.
+
+Binding to a non-loopback address without an explicit origin allowlist is refused at startup. Private-network reachability and the explicit origin allowlist are the trust boundary: there are no accounts or identity authentication. Any peer that can reach the companion and supply an allowed origin can obtain a token and read or modify the owner's discovered library, including restoring archived files. Use private-network access controls to limit reachable peers and HTTPS to protect data in transit. Non-allowlisted origins are rejected. In remote mode, every API read and mutation requires the per-start token even without browser headers; session bootstrap requires an allowed origin, and CORS preflight does not require a token. Header-free command-line clients connected over loopback can omit the token only when the companion is also bound to loopback.
+
+Files, archives, and native actions remain on the host Mac. Folder pickers, Finder reveals, and opening live or archived reviews execute there. Pasted project paths refer to folders on that Mac. This option exposes the library UI and companion; the Lavish review server retains its separate local configuration.
 
 ## License
 
@@ -110,6 +139,6 @@ The web UI listens on localhost and its filesystem companion service listens on 
 
 Run `npm test`, `npm run lint`, `npm run typecheck`, and `npm run build`. Session reply counts measure retained agent replies; reviewer messages still contribute to last-used timestamps. Upstream bounds retained chat, so these counts are not lifetime totals.
 
-CI uses the dedicated `ji7-lavish-library` runner on JI7 for main pushes and same-repository pull requests. Fork pull requests use GitHub-hosted Ubuntu runners. The repository Actions setting requires approval for **all external contributors**. The self-hosted job also checks the PR head repository before scheduling. Keep both protections in place; reviewing a fork workflow must include checking any changes to runner selection. Release Please stays on GitHub-hosted Ubuntu because it needs only GitHub API/token access.
+Run `npm run test:backup-ui` with `chrome-devtools-axi` installed to exercise backup warnings, keyboard retry, last-success dates, summary recovery, overlapping refreshes, background-tab loading, and recovery from folder-addition and archive-pause errors in an isolated browser against synthetic data. This opt-in check does not use an installed Lavish library. Set `LAVISH_BACKUP_SCREENSHOT_DIR` to a local output folder to capture desktop and mobile warning layouts.
 
-The JI7 runner runs as the `fm-manage` user service `actions-runner-ji7-lavish-library.service`, with labels `self-hosted`, `Linux`, `X64`, `ji7`, and `lavish-library`. Its installation is `/home/fm-manage/actions-runners/ji7-lavish-library`; its work directory is `_work`. It follows the existing user-systemd runner setup and is enabled at startup.
+CI runs tests, lint, type checks, and the production build on GitHub-hosted Ubuntu runners for main pushes and pull requests. Release Please also uses a GitHub-hosted runner.

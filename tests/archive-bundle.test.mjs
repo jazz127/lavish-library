@@ -1,13 +1,15 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
+import { createReadFailure } from './helpers/read-failure.mjs';
 
-async function fixture(run) {
+async function fixture(run, { pauseAfterVersion, pauseArchiveName = 'archive', pauseReason, pauseReadFile, pauseReadArchiveName = 'archive', pauseBeforePublication = false, pauseRestoreWrite = false, trackArchiveReads = false, readFailures = false } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'lavish-bundle-'));
   const sourceDir = path.join(directory, 'project', '.lavish');
   const stateDir = path.join(directory, 'state');
@@ -28,10 +30,60 @@ async function fixture(run) {
   await new Promise((resolve) => socket.listen(0, '127.0.0.1', resolve));
   const port = socket.address().port;
   await new Promise((resolve) => socket.close(resolve));
-  const service = spawn(process.execPath, ['scripts/local-api.mjs'], {
+  const serviceArgs = [];
+  const readFailure = readFailures ? await createReadFailure(directory) : null;
+  if (readFailure) serviceArgs.push('--import', readFailure.preload);
+  const pauseEnabled = Boolean(pauseAfterVersion || pauseReadFile || pauseBeforePublication || pauseRestoreWrite || trackArchiveReads);
+  if (pauseEnabled) {
+    // Hold the manifest rename's completion after its bytes become observable.
+    // IPC lets the test delete a dependency in that window without a timed sleep.
+    const preload = path.join(directory, 'pause-manifest.mjs');
+    await writeFile(preload, `
+      import fs from 'node:fs/promises';
+      import { once } from 'node:events';
+      import { syncBuiltinESMExports } from 'node:module';
+      const rename = fs.rename;
+      const readFile = fs.readFile;
+      const writeFile = fs.writeFile;
+      const appendFile = fs.appendFile;
+      let paused = false;
+      const pause = async (message) => {
+        paused = true;
+        const resumed = once(process, 'message');
+        process.send(message);
+        await resumed;
+      };
+      fs.readFile = async (file, ...args) => {
+        const bytes = await readFile(file, ...args);
+        if (${trackArchiveReads} && String(file).includes('/versions/') && String(file).endsWith('.html')) await appendFile(${JSON.stringify(path.join(directory, 'archive-reads.log'))}, String(file) + '\\n');
+        if (!paused && ${Boolean(pauseReadFile)} && file === ${JSON.stringify(path.join(sourceDir, pauseReadFile || ''))}) {
+          const config = JSON.parse(await readFile(${JSON.stringify(path.join(configDir, 'config.json'))}, 'utf8'));
+          if (config.archiveRoot === ${JSON.stringify(path.join(directory, pauseReadArchiveName))}) await pause('read-paused');
+        }
+        return bytes;
+      };
+      fs.writeFile = async (file, ...args) => {
+        await writeFile(file, ...args);
+        if (!paused && ${pauseRestoreWrite} && file === ${JSON.stringify(file)} && (await readFile(${JSON.stringify(file)}, 'utf8')) === ${JSON.stringify(html)}) await pause('restore-write-paused');
+        if (!paused && ${pauseBeforePublication} && file.endsWith('/manifest.json.' + process.pid + '.tmp')) await pause('publication-paused');
+      };
+      fs.rename = async (source, destination) => {
+        await rename(source, destination);
+        if (paused || !destination.endsWith('/manifest.json') || !destination.startsWith(${JSON.stringify(path.join(directory, pauseArchiveName) + path.sep)})) return;
+        const manifest = JSON.parse(await fs.readFile(destination, 'utf8'));
+        if (manifest.versions.length !== ${pauseAfterVersion || 0}) return;
+        if (${JSON.stringify(pauseReason || '')} && manifest.versions.at(-1).reason !== ${JSON.stringify(pauseReason || '')}) return;
+        await pause('manifest-published');
+      };
+      syncBuiltinESMExports();
+    `);
+    serviceArgs.push('--import', preload);
+  }
+  const service = spawn(process.execPath, [...serviceArgs, 'scripts/local-api.mjs'], {
     env: { ...process.env, LAVISH_TRACKER_API_PORT: String(port), LAVISH_TRACKER_CONFIG_DIR: configDir, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_AXI_BIN: '/usr/bin/true' },
-    stdio: 'ignore',
+    stdio: pauseEnabled ? ['ignore', 'ignore', 'ignore', 'ipc'] : 'ignore',
   });
+  const publicationPaused = pauseEnabled ? once(service, 'message') : null;
   const exited = once(service, 'exit');
   const api = `http://127.0.0.1:${port}/api`;
   const get = async (route) => {
@@ -52,7 +104,7 @@ async function fixture(run) {
       try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break; } catch { /* Starting. */ }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    await run({ directory, sourceDir, file, html, api, get, post, history });
+    await run({ directory, sourceDir, file, html, api, get, post, history, publicationPaused, setUnreadableFiles: readFailure?.setUnreadableFiles, archiveReads: async () => (await readFile(path.join(directory, 'archive-reads.log'), 'utf8').catch(() => '')).trim().split('\n').filter(Boolean), resumePublication: () => service.send('resume') });
   } finally {
     service.kill('SIGTERM');
     await exited;
@@ -69,9 +121,53 @@ async function waitForVersion(history, count) {
   assert.fail(`Watcher did not archive ${count} versions`);
 }
 
+for (const unreadablePath of ['plan.html', 'assets/style.css', 'assets/logo.png', 'assets/nested/icon.png']) {
+  test(`saved history survives current bundle read failure for ${unreadablePath}`, async () => {
+    await fixture(async ({ sourceDir, file, html, get, post, history, setUnreadableFiles }) => {
+      await post('/artifacts/snapshot');
+      const original = await history();
+      const baseline = original.versions[0];
+      assert.equal(baseline.isCurrent, true);
+      const unreadableFile = path.join(sourceDir, unreadablePath);
+      await setUnreadableFiles([unreadableFile]);
+      await writeFile(file, `${html}<h1>Unsaved edit</h1>`);
+      const library = await get('/library');
+      assert.match(library.artifacts[0].backupError, /EACCES/);
+      assert.equal(library.archive.failedArtifacts, 1);
+      assert.equal(library.archive.protectedArtifacts, 0);
+      assert.equal(library.artifacts[0].versionCount, 1);
+      for (let open = 0; open < 2; open += 1) {
+        const saved = await history();
+        assert.equal(saved.enabled, true);
+        assert.equal(saved.sourceExists, true);
+        assert.equal(saved.versions.length, 1);
+        assert.equal(saved.versions[0].id, baseline.id);
+        assert.equal(saved.versions[0].isCurrent, false);
+      }
+      const archivedFile = path.join(original.archivePath, baseline.file);
+      assert.equal(await readFile(archivedFile, 'utf8'), html);
+      const manifestFile = path.join(original.archivePath, 'manifest.json');
+      const manifest = JSON.parse(await readFile(manifestFile, 'utf8'));
+      delete manifest.versions[0].bundleSha256;
+      manifest.versions[0].supplementalAssets = ['assets/nested/icon.png'];
+      await writeFile(manifestFile, JSON.stringify(manifest));
+      await setUnreadableFiles([unreadableFile, archivedFile]);
+      assert.equal((await history()).versions[0].isCurrent, false);
+      await setUnreadableFiles([]);
+      assert.equal((await history()).versions[0].isCurrent, false);
+      await post('/versions/restore', { file, versionId: baseline.id });
+      assert.equal(await readFile(file, 'utf8'), html);
+      const restored = await history();
+      assert.equal(restored.versions.filter((version) => version.isCurrent).length, 1);
+      assert.equal(restored.versions[0].isCurrent, true);
+      assert.ok(restored.versions.some((version) => version.id === baseline.id));
+    }, { readFailures: true });
+  });
+}
+
 test('reconciliation archives asset-only edits and current compares the complete bundle', async () => {
   await fixture(async ({ sourceDir, get, post, history }) => {
-    await post('/artifacts/snapshot'); // No watcher installed: reconciliation must catch the edit.
+    await post('/artifacts/snapshot');
     const baseline = (await history()).versions[0];
     await writeFile(path.join(sourceDir, 'assets/logo.png'), 'logo-two');
     assert.equal((await history()).versions.some((version) => version.isCurrent), false);
@@ -87,8 +183,198 @@ test('reconciliation archives asset-only edits and current compares the complete
   });
 });
 
+async function editPublishedDependency(context, publication, versionCount) {
+  const { sourceDir, history, publicationPaused, resumePublication } = context;
+  assert.equal((await publicationPaused)[0], 'manifest-published');
+  const published = await history();
+  assert.equal(published.versions.length, versionCount);
+  const icon = path.join(sourceDir, 'assets/nested/icon.png');
+  // macOS starts its native FSEvents subscription asynchronously. Keep the
+  // publication paused while it starts, so installing watchers only after
+  // the snapshot/scan resolves still cannot capture this edit.
+  if (process.platform === 'darwin') await new Promise((resolve) => setTimeout(resolve, 300));
+  await writeFile(icon, 'edited-after-publication');
+  resumePublication();
+  await publication;
+  const changed = await waitForVersion(history, versionCount + 1);
+  assert.equal(changed.versions[0].reason, 'change');
+  assert.equal(changed.versions[0].isCurrent, true);
+  assert.equal(await readFile(path.join(changed.archivePath, path.dirname(changed.versions[0].file), 'assets/nested/icon.png'), 'utf8'), 'edited-after-publication');
+  assert.equal(await readFile(path.join(published.archivePath, path.dirname(published.versions[0].file), 'assets/nested/icon.png'), 'utf8'), 'icon-one');
+  return changed;
+}
+
+test('manual snapshot watches dependencies before its first manifest is published', { timeout: 15_000 }, async () => {
+  await fixture(async (context) => {
+    await editPublishedDependency(context, context.post('/artifacts/snapshot'), 1);
+  }, { pauseAfterVersion: 1 });
+});
+
+test('initial archive setup watches each artifact before its baseline is published', { timeout: 15_000 }, async () => {
+  await fixture(async (context) => {
+    const { directory, sourceDir, file, get } = context;
+    const configFile = path.join(directory, 'config/config.json');
+    await writeFile(configFile, JSON.stringify({ projects: [], archiveRoot: null }));
+    const secondFile = path.join(sourceDir, 'other/second.html');
+    await mkdir(path.dirname(secondFile));
+    await writeFile(secondFile, '<title>Second artifact</title>');
+    await writeFile(path.join(directory, 'state/state.json'), JSON.stringify({ sessions: { demo: { file }, second: { file: secondFile } } }));
+    assert.equal((await get('/library')).artifacts.length, 2);
+    await writeFile(configFile, JSON.stringify({ projects: [], archiveRoot: path.join(directory, 'archive') }));
+    await editPublishedDependency(context, get('/library'), 1);
+    await writeFile(secondFile, '<title>Second artifact edited</title>');
+    const secondHistory = () => get(`/artifacts/versions?file=${encodeURIComponent(secondFile)}`);
+    const secondChanged = await waitForVersion(secondHistory, 2);
+    assert.equal(secondChanged.versions[0].reason, 'change');
+    assert.equal(await readFile(path.join(secondChanged.archivePath, secondChanged.versions[0].file), 'utf8'), '<title>Second artifact edited</title>');
+  }, { pauseAfterVersion: 1 });
+});
+
+test('archive switches replace dependency watchers before publishing the new baseline', { timeout: 15_000 }, async () => {
+  await fixture(async (context) => {
+    const { directory, get } = context;
+    await get('/library');
+    const nextArchive = path.join(directory, 'archive-next');
+    await writeFile(path.join(directory, 'config/config.json'), JSON.stringify({ projects: [], archiveRoot: nextArchive }));
+    const changed = await editPublishedDependency(context, get('/library'), 1);
+    assert.equal(changed.archivePath.startsWith(nextArchive + path.sep), true);
+  }, { pauseAfterVersion: 1, pauseArchiveName: 'archive-next' });
+});
+
+test('missing-source restore watches recreated dependencies before publishing its version', { timeout: 15_000 }, async () => {
+  await fixture(async (context) => {
+    const { file, post, get, history } = context;
+    await post('/artifacts/snapshot');
+    const baseline = (await history()).versions[0];
+    await writeFile(file, '<title>Newer document</title>');
+    await post('/artifacts/snapshot');
+    await rm(file);
+    await get('/library');
+    await editPublishedDependency(context, post('/versions/restore', { file, versionId: baseline.id }), 3);
+  }, { pauseAfterVersion: 3, pauseReason: 'restore' });
+});
+
+test('deduplicated snapshots rearm dependency watchers after archive is re-enabled', async () => {
+  await fixture(async ({ directory, sourceDir, post, history }) => {
+    await post('/artifacts/snapshot');
+    await post('/archive/disable', {});
+    await writeFile(path.join(directory, 'config/config.json'), JSON.stringify({ projects: [], archiveRoot: path.join(directory, 'archive') }));
+    await post('/artifacts/snapshot');
+    assert.equal((await history()).versions.length, 1);
+    await writeFile(path.join(sourceDir, 'assets/nested/icon.png'), 'changed-after-rearming');
+    const changed = await waitForVersion(history, 2);
+    assert.equal(changed.versions[0].reason, 'change');
+    assert.equal(await readFile(path.join(changed.archivePath, path.dirname(changed.versions[0].file), 'assets/nested/icon.png'), 'utf8'), 'changed-after-rearming');
+  });
+});
+
+for (const [stage, options] of [
+  ['collection', { pauseReadFile: 'assets/nested/icon.png' }],
+  ['publication', { pauseBeforePublication: true }],
+]) {
+  test(`pause during ${stage} prevents a pending snapshot from publishing or restarting backups`, { timeout: 15_000 }, async () => {
+    await fixture(async ({ sourceDir, file, api, post, get, history, publicationPaused, resumePublication }) => {
+      const pending = fetch(`${api}/artifacts/snapshot`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ file }) });
+      await publicationPaused;
+      const archived = await history();
+      await post('/archive/disable', {});
+      assert.equal((await get('/library')).archive.enabled, false);
+      resumePublication();
+      const response = await pending;
+      assert.equal(response.status, 400);
+      assert.match((await response.json()).error, /Archive settings changed/);
+      assert.deepEqual(await readdir(path.join(archived.archivePath, 'versions')).catch((error) => error.code === 'ENOENT' ? [] : Promise.reject(error)), []);
+      assert.deepEqual((await readdir(archived.archivePath).catch(() => [])).filter((name) => name.endsWith('.tmp')), []);
+      await writeFile(path.join(sourceDir, 'assets/nested/icon.png'), 'edited-while-paused');
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      await assert.rejects(readFile(path.join(archived.archivePath, 'manifest.json')), { code: 'ENOENT' });
+    }, options);
+  });
+}
+
+test('an old autosave queued behind an archive switch cannot reclaim the new watchers', { timeout: 15_000 }, async () => {
+  await fixture(async ({ directory, sourceDir, post, get, history, publicationPaused, resumePublication }) => {
+    await post('/artifacts/snapshot');
+    const previous = await history();
+    const nextArchive = path.join(directory, 'archive-next');
+    await writeFile(path.join(directory, 'config/config.json'), JSON.stringify({ projects: [], archiveRoot: nextArchive }));
+    const scanning = get('/library');
+    assert.equal((await publicationPaused)[0], 'read-paused');
+    const icon = path.join(sourceDir, 'assets/nested/icon.png');
+    await writeFile(icon, 'edited-during-switch');
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    resumePublication();
+    await scanning;
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    const oldManifest = JSON.parse(await readFile(path.join(previous.archivePath, 'manifest.json'), 'utf8'));
+    assert.equal(oldManifest.versions.length, 1);
+    await writeFile(icon, 'new-archive-only');
+    const changed = await waitForVersion(history, 2);
+    assert.equal(changed.archivePath.startsWith(nextArchive + path.sep), true);
+    assert.equal(changed.versions[0].reason, 'change');
+    assert.equal(await readFile(path.join(changed.archivePath, path.dirname(changed.versions[0].file), 'assets/nested/icon.png'), 'utf8'), 'new-archive-only');
+  }, { pauseReadFile: 'assets/nested/icon.png', pauseReadArchiveName: 'archive-next' });
+});
+
+test('superseded scan cleanup leaves the active archive watchers intact', { timeout: 15_000 }, async () => {
+  await fixture(async ({ directory, sourceDir, get, history, publicationPaused, resumePublication }) => {
+    const oldScan = get('/library');
+    assert.equal((await publicationPaused)[0], 'read-paused');
+    const nextArchive = path.join(directory, 'archive-next');
+    await writeFile(path.join(directory, 'config/config.json'), JSON.stringify({ projects: [], archiveRoot: nextArchive }));
+    const active = await get('/library');
+    assert.equal(active.archive.root, nextArchive);
+    assert.equal(active.archive.totalVersions, 1);
+    resumePublication();
+    await oldScan;
+    await writeFile(path.join(sourceDir, 'assets/nested/icon.png'), 'active-scan-watchers');
+    const changed = await waitForVersion(history, 2);
+    assert.equal(changed.versions[0].reason, 'change');
+    assert.equal(await readFile(path.join(changed.archivePath, path.dirname(changed.versions[0].file), 'assets/nested/icon.png'), 'utf8'), 'active-scan-watchers');
+  }, { pauseReadFile: 'plan.html' });
+});
+
+for (const keepExisting of [false, true]) {
+  test(`a stale same-archive scan preserves ${keepExisting ? 'refreshed' : 'newly installed'} restore watchers`, { timeout: 15_000 }, async () => {
+    await fixture(async ({ directory, sourceDir, file, html, get, post, publicationPaused, resumePublication }) => {
+      const secondDir = path.join(sourceDir, 'recovery');
+      const secondFile = path.join(secondDir, 'second.html');
+      const secondHtml = '<title>Recovered artifact</title><img src="nested/icon.png">';
+      const icon = path.join(secondDir, 'nested/icon.png');
+      await mkdir(path.dirname(icon), { recursive: true });
+      await writeFile(secondFile, secondHtml);
+      await writeFile(icon, 'recovery-baseline');
+      await writeFile(path.join(directory, 'state/state.json'), JSON.stringify({ sessions: { demo: { file }, second: { file: secondFile } } }));
+      await post('/artifacts/snapshot');
+      await post('/artifacts/snapshot', { file: secondFile });
+      const secondHistory = () => get(`/artifacts/versions?file=${encodeURIComponent(secondFile)}`);
+      const baseline = (await secondHistory()).versions[0];
+      await rm(secondFile);
+      if (!keepExisting) await get('/library');
+      await writeFile(file, `${html}<p>Changed before scanning</p>`);
+      const scanning = get('/library');
+      assert.equal((await publicationPaused)[0], 'manifest-published');
+      const restored = await post('/versions/restore', { file: secondFile, versionId: baseline.id });
+      assert.equal(restored.sourceRecreated, true);
+      resumePublication();
+      const stale = await scanning;
+      assert.equal(stale.artifacts.find((artifact) => artifact.file === secondFile).exists, false);
+      await writeFile(icon, 'edited-after-restoring');
+      const assetChange = await waitForVersion(secondHistory, 2);
+      assert.equal(assetChange.versions[0].reason, 'change');
+      assert.equal(await readFile(path.join(assetChange.archivePath, path.dirname(assetChange.versions[0].file), 'nested/icon.png'), 'utf8'), 'edited-after-restoring');
+      const updatedHtml = `${secondHtml}<p>Changed after restoring</p>`;
+      await writeFile(`${secondFile}.tmp`, updatedHtml);
+      await rename(`${secondFile}.tmp`, secondFile);
+      const htmlChange = await waitForVersion(secondHistory, 3);
+      assert.equal(htmlChange.versions[0].reason, 'change');
+      assert.equal(await readFile(path.join(htmlChange.archivePath, htmlChange.versions[0].file), 'utf8'), updatedHtml);
+    }, { pauseAfterVersion: 2 });
+  });
+}
+
 test('directory watchers archive nested assets and survive atomic replacement', async () => {
-  await fixture(async ({ sourceDir, get, history }) => {
+  await fixture(async ({ sourceDir, get, history, publicationPaused, resumePublication }) => {
     await get('/library');
     const icon = path.join(sourceDir, 'assets/nested/icon.png');
     await writeFile(`${icon}.tmp`, 'icon-two');
@@ -106,10 +392,16 @@ test('directory watchers archive nested assets and survive atomic replacement', 
     await writeFile(path.join(sourceDir, 'assets/nested/new/deep.png'), 'new-dependency');
     result = await waitForVersion(history, 5);
     assert.equal(result.versions[0].reason, 'change');
+    assert.equal(result.versions[0].isCurrent, true);
+    assert.equal((await publicationPaused)[0], 'manifest-published');
+    // Delete while version 5 is visible but its publication call is still pending.
+    // The new dependency directory must already be watched at this point.
     await rm(path.join(sourceDir, 'assets/nested/new/deep.png'));
+    resumePublication();
     result = await waitForVersion(history, 6);
+    assert.equal(result.versions[0].reason, 'change');
     assert(result.versions[0].bundle.some((entry) => entry.path === 'assets/nested/new/deep.png' && entry.status === 'missing'));
-  });
+  }, { pauseAfterVersion: 5 });
 });
 
 test('restore snapshots newer asset bytes, including assets omitted by current HTML', async () => {
@@ -453,4 +745,103 @@ test('missing-source recovery keeps archive and asset paths within their folders
       await assert.rejects(readFile(file), { code: 'ENOENT' });
     }
   });
+});
+
+for (const change of ['pause', 'switch']) {
+  test(`restore finishes in its original archive when settings ${change} after source writes begin`, { timeout: 15_000 }, async () => {
+    await fixture(async ({ directory, sourceDir, file, html, api, post, history, publicationPaused, resumePublication }) => {
+      await post('/artifacts/snapshot');
+      const baseline = (await history()).versions[0];
+      await writeFile(file, '<title>New content before restore</title>');
+      await writeFile(path.join(sourceDir, 'assets/logo.png'), 'new-logo');
+      const pending = fetch(`${api}/versions/restore`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ file, versionId: baseline.id }) });
+      assert.equal((await publicationPaused)[0], 'restore-write-paused');
+      if (change === 'pause') await post('/archive/disable', {});
+      else await writeFile(path.join(directory, 'config/config.json'), JSON.stringify({ projects: [], archiveRoot: path.join(directory, 'archive-next') }));
+      resumePublication();
+      const response = await pending;
+      assert.equal(response.status, 200, JSON.stringify(await response.json()));
+      assert.equal(await readFile(file, 'utf8'), html);
+      assert.equal(await readFile(path.join(sourceDir, 'assets/logo.png'), 'utf8'), 'logo-one');
+      const archivePath = path.join(directory, 'archive', 'Lavish Library Archive', 'project');
+      const [artifactDir] = await readdir(archivePath);
+      const manifest = JSON.parse(await readFile(path.join(archivePath, artifactDir, 'manifest.json'), 'utf8'));
+      assert.deepEqual(manifest.versions.map((version) => version.reason), ['manual', 'pre-restore', 'restore']);
+      await writeFile(path.join(sourceDir, 'assets/logo.png'), 'after-restore');
+      await new Promise((resolve) => setTimeout(resolve, 1100));
+      assert.equal(JSON.parse(await readFile(path.join(archivePath, artifactDir, 'manifest.json'), 'utf8')).versions.length, 3);
+    }, { pauseRestoreWrite: true });
+  });
+}
+
+test('history avoids reading archived HTML for snapshots with stored revision metadata', async () => {
+  await fixture(async ({ file, post, history, archiveReads }) => {
+    for (let i = 0; i < 3; i += 1) {
+      await writeFile(file, `<title>Large version ${i}</title>` + 'x'.repeat(1_000_000));
+      await post('/artifacts/snapshot');
+    }
+    assert.equal((await history()).versions.length, 3);
+    await history();
+    assert.equal((await archiveReads()).length, 0);
+  }, { trackArchiveReads: true });
+});
+
+test('legacy history caches revision declarations including absent registries', async () => {
+  await fixture(async ({ post, history, archiveReads }) => {
+    await post('/artifacts/snapshot');
+    const first = await history();
+    const manifestFile = path.join(first.archivePath, 'manifest.json');
+    const manifest = JSON.parse(await readFile(manifestFile, 'utf8'));
+    delete manifest.versions[0].revisionContext;
+    await writeFile(manifestFile, JSON.stringify(manifest));
+    const before = (await archiveReads()).length;
+    assert.deepEqual((await history()).versions[0].revisionContext, []);
+    assert.deepEqual((await history()).versions[0].revisionContext, []);
+    assert.equal((await archiveReads()).length - before, 1);
+    await writeFile(path.join(first.archivePath, first.versions[0].file), '<script data-lavish-revisions>[{"id":"changed"}]</script>');
+    assert.equal((await history()).versions[0].revisionContext[0].id, 'changed');
+    assert.equal((await archiveReads()).length - before, 2);
+  }, { trackArchiveReads: true });
+});
+
+test('legacy history larger than the cache preserves hits across repeated opens', async () => {
+  await fixture(async ({ post, history, archiveReads, html }) => {
+    await post('/artifacts/snapshot');
+    const first = await history();
+    const manifestFile = path.join(first.archivePath, 'manifest.json');
+    const manifest = JSON.parse(await readFile(manifestFile, 'utf8'));
+    const baseline = manifest.versions[0];
+    const baselineDirectory = path.join(first.archivePath, path.dirname(baseline.file));
+    manifest.versions = [];
+    for (let index = 0; index < 260; index += 1) {
+      const id = `legacy-${index}`;
+      const version = structuredClone(baseline);
+      version.id = id;
+      version.file = `versions/${id}/plan.html`;
+      delete version.revisionContext;
+      const context = index % 2 === 0 ? [{ id }] : [];
+      const bytes = html + (context.length ? `<script data-lavish-revisions>${JSON.stringify(context)}</script>` : '');
+      await cp(baselineDirectory, path.join(first.archivePath, 'versions', id), { recursive: true });
+      await writeFile(path.join(first.archivePath, version.file), bytes);
+      version.sha256 = createHash('sha256').update(bytes).digest('hex');
+      version.bundle.find((entry) => entry.path === 'plan.html').sha256 = version.sha256;
+      version.bundleSha256 = createHash('sha256').update(JSON.stringify(version.bundle)).digest('hex');
+      version.size = Buffer.byteLength(bytes);
+      manifest.versions.push(version);
+    }
+    await writeFile(manifestFile, JSON.stringify(manifest));
+    let reads = (await archiveReads()).length;
+    for (let open = 0; open < 4; open += 1) {
+      const result = await history();
+      assert.equal(result.versions.length, 260);
+      for (const version of result.versions) {
+        const index = Number(version.id.slice('legacy-'.length));
+        assert.deepEqual(version.revisionContext.map((entry) => entry.id), index % 2 === 0 ? [version.id] : []);
+      }
+      const nextReads = (await archiveReads()).length;
+      if (open === 0) assert.equal(nextReads - reads, 260);
+      else assert.ok(nextReads - reads <= 4, `Reopening reread ${nextReads - reads} archived HTML files`);
+      reads = nextReads;
+    }
+  }, { trackArchiveReads: true });
 });
