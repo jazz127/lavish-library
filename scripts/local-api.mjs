@@ -41,6 +41,7 @@ const previews = createPreviewCache({
 const artifactWatchers = new Map();
 const snapshotQueues = new Map();
 const legacyBundleShas = new Map();
+const legacyRevisionContexts = new Map();
 let analyticsQueue = Promise.resolve();
 let gitCache = { at: 0, value: [] };
 let knownArtifactsCache = { key: '', at: 0, value: null, pending: null };
@@ -58,9 +59,14 @@ async function readJson(file, fallback) {
 async function writeJson(file, value, beforePublish) {
   await mkdir(path.dirname(file), { recursive: true });
   const temporary = `${file}.${process.pid}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-  if (beforePublish) await beforePublish();
-  await rename(temporary, file);
+  try {
+    await writeFile(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+    if (beforePublish) await beforePublish();
+    await rename(temporary, file);
+  } catch (error) {
+    await rm(temporary, { force: true });
+    throw error;
+  }
 }
 
 async function readConfig() {
@@ -448,9 +454,15 @@ async function readManifest(config, artifact) {
   return manifest;
 }
 
-async function snapshotArtifactNow(config, artifact, reason = 'scan', supplementalAssets = []) {
+async function snapshotArtifactNow(config, artifact, reason = 'scan', supplementalAssets = [], { finishRestore = false } = {}) {
   if (!config.archiveRoot) return null;
-  await requireActiveArchive(config);
+  // Once restore has started overwriting source files, finish its history in
+  // the archive that holds its safety copy, even if backups were paused.
+  const validateArchive = async () => { if (!finishRestore) await requireActiveArchive(config); };
+  const refreshWatchers = async () => {
+    if (!finishRestore || (await readConfig()).archiveRoot === config.archiveRoot) refreshArtifactWatchers(config, artifact, watchDirs);
+  };
+  await validateArchive();
   if (!artifact.exists) return null;
   const collected = await collectBundle(artifact.file, supplementalAssets);
   const { html, bundle, bundleSha256, watchDirs } = collected;
@@ -458,8 +470,8 @@ async function snapshotArtifactNow(config, artifact, reason = 'scan', supplement
   const manifest = await readManifest(config, artifact);
   const latest = manifest.versions.at(-1);
   if (latest && await archivedBundleSha(config, artifact, latest).catch(() => null) === bundleSha256) {
-    await requireActiveArchive(config);
-    refreshArtifactWatchers(config, artifact, watchDirs);
+    await validateArchive();
+    await refreshWatchers();
     return { manifest };
   }
 
@@ -469,39 +481,46 @@ async function snapshotArtifactNow(config, artifact, reason = 'scan', supplement
   const versionId = `${stamp}-${bundleSha256.slice(0, 12)}-${randomBytes(3).toString('hex')}`;
   const versionDir = path.join(artifactArchiveDir(config, artifact), 'versions', versionId);
   const archivedFile = path.join(versionDir, path.basename(artifact.file));
-  await mkdir(versionDir, { recursive: true });
-  for (const entry of bundle) {
-    const destination = path.join(versionDir, entry.path);
-    if (entry.status === 'directory') await mkdir(destination, { recursive: true });
-    if (entry.status !== 'file') continue;
-    await mkdir(path.dirname(destination), { recursive: true });
-    await writeFile(destination, collected.files.get(entry.path));
+  try {
+    await mkdir(versionDir, { recursive: true });
+    for (const entry of bundle) {
+      const destination = path.join(versionDir, entry.path);
+      if (entry.status === 'directory') await mkdir(destination, { recursive: true });
+      if (entry.status !== 'file') continue;
+      await mkdir(path.dirname(destination), { recursive: true });
+      await writeFile(destination, collected.files.get(entry.path));
+    }
+    const assetsCopied = collected.files.size - 1;
+
+    manifest.schemaVersion = 2;
+
+    manifest.sourceFile = artifact.file;
+    manifest.title = artifact.title;
+    manifest.projectName = artifact.projectName;
+    manifest.versions.push({
+      id: versionId,
+      createdAt,
+      sourceModifiedAt: sourceStat.mtime.toISOString(),
+      sha256: contentSha,
+      bundleSha256,
+      bundle,
+      ...(supplementalAssets.length ? { supplementalAssets } : {}),
+      size: collected.htmlBytes.length,
+      lineCount: html.split(/\r?\n/).length,
+      assetsCopied,
+      reason,
+      revisionContext: revisionContext(html),
+      file: path.relative(artifactArchiveDir(config, artifact), archivedFile),
+    });
+    await writeJson(manifestPath(config, artifact), manifest, async () => {
+      await validateArchive();
+      await refreshWatchers();
+    });
+  } catch (error) {
+    // No manifest references this unique directory until publication succeeds.
+    await rm(versionDir, { recursive: true, force: true });
+    throw error;
   }
-  const assetsCopied = collected.files.size - 1;
-
-  manifest.schemaVersion = 2;
-
-  manifest.sourceFile = artifact.file;
-  manifest.title = artifact.title;
-  manifest.projectName = artifact.projectName;
-  manifest.versions.push({
-    id: versionId,
-    createdAt,
-    sourceModifiedAt: sourceStat.mtime.toISOString(),
-    sha256: contentSha,
-    bundleSha256,
-    bundle,
-    ...(supplementalAssets.length ? { supplementalAssets } : {}),
-    size: collected.htmlBytes.length,
-    lineCount: html.split(/\r?\n/).length,
-    assetsCopied,
-    reason,
-    file: path.relative(artifactArchiveDir(config, artifact), archivedFile),
-  });
-  await writeJson(manifestPath(config, artifact), manifest, async () => {
-    await requireActiveArchive(config);
-    refreshArtifactWatchers(config, artifact, watchDirs);
-  });
   return { manifest };
 }
 
@@ -726,11 +745,20 @@ async function artifactForFile(file) {
 
 // Read declarations from the saved bytes, including archives made before
 // this feature. Never attribute today's declarations to an older snapshot.
-async function archivedRevisionContext(directory, version) {
+async function archivedRevisionContext(directory, version, cachedContexts) {
   try {
     const archivedFile = path.resolve(directory, version.file);
     if (!insideFolder(directory, archivedFile) || await localPathStatus(directory, archivedFile) !== 'file') return [];
-    return revisionContext(await readFile(archivedFile, 'utf8'));
+    await access(archivedFile, constants.R_OK);
+    if (Array.isArray(version.revisionContext)) return version.revisionContext;
+    const key = await fileCacheKey(archivedFile);
+    const cached = cachedContexts.get(archivedFile);
+    if (cached?.key === key) return cached.context;
+    const context = revisionContext(await readFile(archivedFile, 'utf8'));
+    legacyRevisionContexts.delete(archivedFile);
+    legacyRevisionContexts.set(archivedFile, { key, context });
+    if (legacyRevisionContexts.size > 256) legacyRevisionContexts.delete(legacyRevisionContexts.keys().next().value);
+    return context;
   } catch {
     return [];
   }
@@ -748,23 +776,32 @@ async function versionsFor(file) {
     const supplementalAssets = version.supplementalAssets || [];
     const key = JSON.stringify(supplementalAssets);
     if (!artifact.exists) continue;
-    if (!currentShas.has(key)) currentShas.set(key, (await collectBundle(artifact.file, supplementalAssets)).bundleSha256);
+    if (!currentShas.has(key)) currentShas.set(key, await collectBundle(artifact.file, supplementalAssets).then((bundle) => bundle.bundleSha256).catch(() => null));
     const currentSha = currentShas.get(key);
+    if (currentSha === null) continue;
     const archivedSha = await archivedBundleSha(config, artifact, version).catch(() => null);
     if (archivedSha === currentSha) currentVersionIndex = index;
   }
   const directory = artifactArchiveDir(config, artifact);
+  const cachedContexts = new Map(legacyRevisionContexts);
   const versions = [];
-  for (const [index, version] of manifest.versions.entries()) {
-    const previous = manifest.versions[index - 1];
-    versions.unshift({
-      ...version,
-      revisionContext: await archivedRevisionContext(directory, version),
-      isCurrent: index === currentVersionIndex,
-      sizeDelta: previous ? version.size - previous.size : 0,
-      lineDelta: previous ? version.lineCount - previous.lineCount : 0,
-    });
+  // Bound cold reads of legacy copies; new entries only read manifest metadata.
+  for (let start = 0; start < manifest.versions.length; start += 4) {
+    const batch = manifest.versions.slice(start, start + 4);
+    const contexts = await Promise.all(batch.map((version) => archivedRevisionContext(directory, version, cachedContexts)));
+    for (const [offset, version] of batch.entries()) {
+      const index = start + offset;
+      const previous = manifest.versions[index - 1];
+      versions.push({
+        ...version,
+        revisionContext: contexts[offset],
+        isCurrent: index === currentVersionIndex,
+        sizeDelta: previous ? version.size - previous.size : 0,
+        lineDelta: previous ? version.lineCount - previous.lineCount : 0,
+      });
+    }
   }
+  versions.reverse();
   return { enabled: true, archivePath: directory, sourceFile: artifact.file, sourceExists: artifact.exists, versions };
 }
 
@@ -833,6 +870,7 @@ async function restoreVersion(file, versionId) {
     const supplementalAssets = targets.map((entry) => entry.path).filter((entry) => entry !== path.basename(artifact.file));
     await snapshotArtifactNow(config, artifact, 'pre-restore', supplementalAssets);
     const { artifactPaths } = await knownProjectMap();
+    await requireActiveArchive(config);
     for (const entry of targets) {
       const destination = path.join(sourceDir, entry.path);
       if (entry.status === 'missing') {
@@ -849,7 +887,7 @@ async function restoreVersion(file, versionId) {
       }
     }
     artifact.exists = true;
-    await snapshotArtifactNow(config, artifact, 'restore', version.supplementalAssets || []);
+    await snapshotArtifactNow(config, artifact, 'restore', version.supplementalAssets || [], { finishRestore: true });
     knownArtifactsCache = { key: '', at: 0, value: null, pending: null };
     return resolved;
   });

@@ -3,6 +3,7 @@ import { createServer } from 'node:http';
 import { mkdtemp, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { createReadFailure } from './read-failure.mjs';
 
 export async function freePort() {
   const server = createServer();
@@ -12,7 +13,7 @@ export async function freePort() {
   return port;
 }
 
-export async function backupFixture(run, { uiPort = 3000 } = {}) {
+export async function backupFixture(run, { uiPort = 3000, readFailures = false } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'lavish-backup-'));
   const source = path.join(directory, 'project', '.lavish');
   const configDir = path.join(directory, 'config');
@@ -25,7 +26,8 @@ export async function backupFixture(run, { uiPort = 3000 } = {}) {
   const configure = async (enabled) => writeFile(path.join(configDir, 'config.json'), JSON.stringify({ projects: [], archiveRoot: enabled ? archiveRoot : null }));
   await configure(false);
   const port = await freePort();
-  const service = spawn(process.execPath, ['scripts/local-api.mjs'], {
+  const readFailure = readFailures ? await createReadFailure(directory) : null;
+  const service = spawn(process.execPath, [...(readFailure ? ['--import', readFailure.preload] : []), 'scripts/local-api.mjs'], {
     env: { ...process.env, LAVISH_TRACKER_CONFIG_DIR: configDir, LAVISH_AXI_STATE_DIR: stateDir, LAVISH_TRACKER_API_PORT: String(port), LAVISH_TRACKER_UI_PORT: String(uiPort), LAVISH_AXI_PORT: String(await freePort()), LAVISH_AXI_BIN: '/usr/bin/true' },
     stdio: ['ignore', 'ignore', 'pipe'],
   });
@@ -59,7 +61,7 @@ export async function backupFixture(run, { uiPort = 3000 } = {}) {
       try { if ((await fetch(`http://127.0.0.1:${port}/health`)).ok) break; } catch { /* Starting. */ }
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
-    await run({ api, file, configure, library, snapshot, blockFirst, unblockFirst, blockNext, unblockNext, readManifest: async () => JSON.parse(await readFile(path.join(await archiveDirectory(), 'manifest.json'), 'utf8')) });
+    await run({ api, file, configure, library, snapshot, blockFirst, unblockFirst, blockNext, unblockNext, setUnreadableFiles: readFailure?.setUnreadableFiles, readManifest: async () => JSON.parse(await readFile(path.join(await archiveDirectory(), 'manifest.json'), 'utf8')) });
   } catch (error) { error.message += `\nCompanion stderr: ${stderr}`; throw error; }
   finally { service.kill('SIGTERM'); await exited; await rm(directory, { recursive: true, force: true }); }
 }
