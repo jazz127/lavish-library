@@ -12,7 +12,7 @@
     "start": "node scripts/run-local.mjs start",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "test": "node --test tests/*.test.mjs",
-    "test:backup-ui": "LAVISH_BACKUP_UI_TEST=1 node --test tests/backup-ui.test.mjs",
+    "test:backup-ui": "LAVISH_BACKUP_UI_TEST=1 node --test tests/backup-ui.test.mjs tests/library-refresh-ui.test.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

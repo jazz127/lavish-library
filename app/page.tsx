@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import InsightsView from './insights-view';
 import ArtifactPreview from './artifact-preview';
 import BackupStatus, { isLatestProtected } from './backup-status';
@@ -128,7 +128,7 @@ export default function Home() {
   const [view, setView] = useState<'grid' | 'list'>('grid');
   const [section, setSection] = useState<PageSection>('library');
   const [loading, setLoading] = useState(true);
-  const [notice, setNotice] = useState<string | { source: 'library' | 'history'; message: string }>('');
+  const [notice, setNotice] = useState<string | { source: 'library' | 'history' | 'manual-folder' | 'archive-pause'; message: string }>('');
   const noticeMessage = typeof notice === 'string' ? notice : notice.message;
   const [manualPath, setManualPath] = useState('');
   const [showAdd, setShowAdd] = useState(false);
@@ -139,57 +139,62 @@ export default function Home() {
   const [backingUp, setBackingUp] = useState<string[]>([]);
   const searchRef = useRef<HTMLInputElement>(null);
   const trackedSearchRef = useRef('');
-  const libraryRequestRef = useRef(0);
+  const libraryRequestRef = useRef<Promise<Library | undefined> | null>(null);
   const historyRefreshRef = useRef<(() => Promise<void>) | null>(null);
   const historyFile = historyArtifact?.file;
 
-  async function loadLibrary(quiet = false) {
-    const request = ++libraryRequestRef.current;
+  const loadLibrary = useCallback(async (quiet = false, signal?: AbortSignal): Promise<Library | undefined> => {
     if (!quiet) setLoading(true);
-    try {
-      const response = await apiFetch('/library', { cache: 'no-store' });
-      if (!response.ok) throw new Error('The local library service did not respond.');
-      const value: Library = await response.json();
-      if (request !== libraryRequestRef.current) return;
-      setLibrary(value);
-      setNotice('');
-      return value;
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'Could not load your library.');
-    } finally {
-      setLoading(false);
+    const fetchLibrary = async (): Promise<Library | undefined> => {
+      try {
+        const response = await apiFetch('/library', { cache: 'no-store', signal });
+        if (!response.ok) throw new Error('The local library service did not respond.');
+        const value: Library = await response.json();
+        if (!signal?.aborted && request === libraryRequestRef.current) {
+          setLibrary(value);
+          setNotice((current) => typeof current !== 'string' && current.source === 'library' ? '' : current);
+        }
+        return value;
+      } catch (error) {
+        if (!signal?.aborted && request === libraryRequestRef.current) {
+          setNotice({ source: 'library', message: error instanceof Error ? error.message : 'Could not load your library.' });
+        }
+      } finally {
+        if (!signal?.aborted && request === libraryRequestRef.current) setLoading(false);
+      }
+    };
+    const request = fetchLibrary();
+    libraryRequestRef.current = request;
+    let latest = request;
+    for (;;) {
+      const value = await latest;
+      if (latest === libraryRequestRef.current) return value;
+      latest = libraryRequestRef.current!;
     }
-  }
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
     let pending = false;
     const refresh = async () => {
       if (pending || document.visibilityState === 'hidden') return;
+      document.removeEventListener('visibilitychange', refresh);
       pending = true;
-      const request = ++libraryRequestRef.current;
       try {
-        const response = await apiFetch('/library', { cache: 'no-store', signal: controller.signal });
-        if (!response.ok) throw new Error('The local library service did not respond.');
-        const value: Library = await response.json();
-        if (!controller.signal.aborted && request === libraryRequestRef.current) {
-          setLibrary(value);
-          setNotice((current) => typeof current !== 'string' && current.source === 'library' ? '' : current);
-        }
-      } catch (error) {
-        if (!controller.signal.aborted && request === libraryRequestRef.current && error instanceof Error) setNotice({ source: 'library', message: error.message });
+        await loadLibrary(true, controller.signal);
       } finally {
         pending = false;
-        if (!controller.signal.aborted) setLoading(false);
       }
     };
+    document.addEventListener('visibilitychange', refresh);
     void refresh();
     const timer = window.setInterval(() => void refresh(), 5000);
     return () => {
       controller.abort();
       window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', refresh);
     };
-  }, []);
+  }, [loadLibrary]);
 
   useEffect(() => {
     if (!historyFile) return;
@@ -298,7 +303,7 @@ export default function Home() {
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || 'Could not add that folder.');
       setShowAdd(false);
-      await loadLibrary(true);
+      if (await loadLibrary(true)) setNotice('');
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Could not add that folder.');
     }
@@ -316,9 +321,10 @@ export default function Home() {
       if (!response.ok) throw new Error(result.error || 'Could not add that folder.');
       setManualPath('');
       setShowAdd(false);
+      setNotice((current) => typeof current !== 'string' && current.source === 'manual-folder' ? '' : current);
       await loadLibrary(true);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'Could not add that folder.');
+      setNotice({ source: 'manual-folder', message: error instanceof Error ? error.message : 'Could not add that folder.' });
     }
   }
 
@@ -373,7 +379,7 @@ export default function Home() {
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || 'Could not configure the archive.');
       setNotice('Creating the first protected copy of each Lavish…');
-      await loadLibrary(true);
+      if (await loadLibrary(true)) setNotice('');
       setShowArchive(true);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Could not configure the archive.');
@@ -386,9 +392,10 @@ export default function Home() {
       const response = await apiFetch('/archive/disable', { method: 'POST' });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || 'Could not pause backups.');
+      setNotice((current) => typeof current !== 'string' && current.source === 'archive-pause' ? '' : current);
       await loadLibrary(true);
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : 'Could not pause backups.');
+      setNotice({ source: 'archive-pause', message: error instanceof Error ? error.message : 'Could not pause backups.' });
     }
   }
 

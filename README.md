@@ -87,7 +87,7 @@ An available server does not confirm that an artifact rendered successfully. Car
 
 Snapshots retain the agent's `script[data-lavish-revisions]` JSON registry from the saved HTML in their manifest metadata, showing its labels, timestamps and summaries as **Agent-declared revisions**. These declarations describe the agent's revision context; they are separate from the archive's measured size and line changes. Missing or malformed registries add nothing. Older snapshots read their saved HTML on demand and use a bounded cache for declarations, including empty results, while the companion is running. **Reveal server.log** appears under the server indicator when the configured state directory contains that ordinary file, including while the server is unavailable.
 
-Open [http://localhost:3000](http://localhost:3000). The library refreshes when the page loads, every five seconds while visible, and whenever you press the refresh button. An open history drawer also refreshes its saved versions and current-version labels as library updates arrive.
+Open [http://localhost:3000](http://localhost:3000). The initial library load waits until the tab is visible. After that, the library refreshes every five seconds while visible and whenever you press the refresh button. An open history drawer also refreshes its saved versions and current-version labels as library updates arrive.
 
 Library cards capture the artifact's first 1200 × 750 pixels locally using an installed Chrome or Chromium. No browser download is bundled: the small `puppeteer-core` driver uses Chrome on macOS or common Chromium/Chrome locations on Linux. Set `LAVISH_TRACKER_BROWSER` to the executable path for another installation. Without a working browser, cards show **Preview unavailable** and opening/history continue to work.
 
@@ -139,6 +139,6 @@ Files, archives, and native actions remain on the host Mac. Folder pickers, Find
 
 Run `npm test`, `npm run lint`, `npm run typecheck`, and `npm run build`. Session reply counts measure retained agent replies; reviewer messages still contribute to last-used timestamps. Upstream bounds retained chat, so these counts are not lifetime totals.
 
-Run `npm run test:backup-ui` with `chrome-devtools-axi` installed to exercise backup warnings, keyboard retry, last-success dates, and summary recovery in an isolated browser against synthetic data. This opt-in check does not use an installed Lavish library. Set `LAVISH_BACKUP_SCREENSHOT_DIR` to a local output folder to capture desktop and mobile warning layouts.
+Run `npm run test:backup-ui` with `chrome-devtools-axi` installed to exercise backup warnings, keyboard retry, last-success dates, summary recovery, overlapping refreshes, background-tab loading, and recovery from folder-addition and archive-pause errors in an isolated browser against synthetic data. This opt-in check does not use an installed Lavish library. Set `LAVISH_BACKUP_SCREENSHOT_DIR` to a local output folder to capture desktop and mobile warning layouts.
 
 CI runs tests, lint, type checks, and the production build on GitHub-hosted Ubuntu runners for main pushes and pull requests. Release Please also uses a GitHub-hosted runner.
