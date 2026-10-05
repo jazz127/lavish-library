@@ -150,9 +150,11 @@ export default function Home() {
       const response = await apiFetch('/library', { cache: 'no-store' });
       if (!response.ok) throw new Error('The local library service did not respond.');
       const value: Library = await response.json();
-      if (request !== libraryRequestRef.current) return;
-      setLibrary(value);
-      setNotice('');
+      if (request === libraryRequestRef.current) {
+        setLibrary(value);
+        setNotice('');
+      }
+      // Action callers still need their result when a newer poll owns state.
       return value;
     } catch (error) {
       setNotice(error instanceof Error ? error.message : 'Could not load your library.');
@@ -185,9 +187,11 @@ export default function Home() {
     };
     void refresh();
     const timer = window.setInterval(() => void refresh(), 5000);
+    document.addEventListener('visibilitychange', refresh);
     return () => {
       controller.abort();
       window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', refresh);
     };
   }, []);
 
