@@ -16,30 +16,30 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "next": "16.4.2",
-    "puppeteer-core": "^25.14.0",
+    "next": "16.4.5",
+    "puppeteer-core": "^25.16.0",
     "react": "19.3.1",
     "react-dom": "19.3.1"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "1.64.0",
-    "@cloudflare/workers-types": "5.20261016.1",
+    "@cloudflare/vite-plugin": "1.67.0",
+    "@cloudflare/workers-types": "5.20261106.1",
     "@openai/sites-vite-plugin": "^0.1.0 || ^0.2.0",
-    "@tailwindcss/postcss": "4.3.3",
-    "@types/node": "26.6.5",
+    "@tailwindcss/postcss": "4.3.4",
+    "@types/node": "26.6.6",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
-    "@vitejs/plugin-react": "6.1.2",
-    "@vitejs/plugin-rsc": "0.5.38",
+    "@vitejs/plugin-react": "6.2.1",
+    "@vitejs/plugin-rsc": "0.5.39",
     "esbuild": "0.28.2",
     "eslint": "9.39.4",
-    "eslint-config-next": "16.4.2",
+    "eslint-config-next": "16.4.5",
     "react-server-dom-webpack": "19.3.1",
-    "tailwindcss": "4.3.3",
+    "tailwindcss": "4.3.4",
     "typescript": "5.9.3",
-    "vinext": "1.2.1",
-    "vite": "8.3.4",
-    "wrangler": "4.151.0"
+    "vinext": "1.4.3",
+    "vite": "8.3.6",
+    "wrangler": "4.158.0"
   },
   "type": "module"
 }
